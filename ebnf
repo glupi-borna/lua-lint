@@ -1,0 +1,40 @@
+chunk ::= {stat [`;´]} [laststat [`;´]]
+block ::= chunk
+stat ::=  varlist `=´ explist |
+     functioncall |
+     do block end |
+     while exp do block end |
+     repeat block until exp |
+     if exp then block {elseif exp then block} [else block] end |
+     for IDENTIFIER `=´ exp `,´ exp [`,´ exp] do block end |
+     for namelist in explist do block end |
+     function funcname funcbody |
+     local function IDENTIFIER funcbody |
+     local namelist [`=´ explist]
+laststat ::= return [explist] | break
+funcname ::= IDENTIFIER {`.´ IDENTIFIER} [`:´ IDENTIFIER]
+varlist ::= var {`,´ var}
+var ::= prefix {suffix} index | IDENTIFIER
+namelist ::= IDENTIFIER {`,´ IDENTIFIER}
+explist ::= {exp `,´} exp
+exp ::= unop exp | value [binop exp]
+functioncall ::= prefix {suffix} call
+args ::=  `(´ [explist] `)´ | tableconstructor | String
+function ::= function funcbody
+funcbody ::= `(´ [parlist] `)´ block end
+parlist ::= namelist [`,´ `...´] | `...´
+tableconstructor ::= `{´ [fieldlist] `}´
+fieldlist ::= field {fieldsep field} [fieldsep]
+field ::= `[´ exp `]´ `=´ exp | IDENTIFIER `=´ exp | exp
+fieldsep ::= `,´ | `;´
+binop ::= `+´ | `-´ | `*´ | `/´ | `^´ | `%´ | `..´ |
+          `<´ | `<=´ | `>´ | `>=´ | `==´ | `~=´ |
+          and | or
+unop ::= `-´ | not | `#´
+value ::= nil | false | true | Number | String | '...' | function |
+          tableconstructor | functioncall | var | '(' exp ')'
+prefix ::= '(' exp ')' | IDENTIFIER
+index ::= '[' exp ']' | '.' IDENTIFIER
+call ::= args | ':' IDENTIFIER args
+suffix ::= call | index
+

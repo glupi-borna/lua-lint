@@ -1,3 +1,4 @@
 #!/bin/bash
 
-tsc ; node dist/lua-lint.js
+BASEDIR="$(dirname "${BASH_SOURCE[0]}")"
+hotpy --cmd "$BASEDIR/build.sh"
