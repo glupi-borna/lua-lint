@@ -1,40 +1,49 @@
 chunk ::= {stat [`;´]} [laststat [`;´]]
 block ::= chunk
-stat ::=  varlist `=´ explist |
+
+doblock ::= `do` block `end`
+assign ::= varlist `=` explist
+while ::= `while` exp `do` block `end`
+repeat ::= `repeat` block `until` exp
+if ::= `if` exp `then` block {`elseif` exp `then` block} [`else` block] `end`
+
+stat ::=
+     assign |
      functioncall |
-     do block end |
-     while exp do block end |
-     repeat block until exp |
-     if exp then block {elseif exp then block} [else block] end |
-     for IDENTIFIER `=´ exp `,´ exp [`,´ exp] do block end |
-     for namelist in explist do block end |
-     function funcname funcbody |
-     local function IDENTIFIER funcbody |
-     local namelist [`=´ explist]
+     doblock |
+     while |
+     repeat |
+     if |
+     `for` ident `=´ exp `,´ exp [`,´ exp] doblock |
+     `for` namelist `in` explist doblock |
+     `function` funcname funcbody |
+     `local` `function` ident funcbody |
+     `local` namelist [`=´ explist]
+
 laststat ::= return [explist] | break
-funcname ::= IDENTIFIER {`.´ IDENTIFIER} [`:´ IDENTIFIER]
+funcname ::= ident {`.´ ident} [`:´ ident]
 varlist ::= var {`,´ var}
-var ::= prefix {suffix} index | IDENTIFIER
-namelist ::= IDENTIFIER {`,´ IDENTIFIER}
+var ::= prefix {suffix} index | ident
+namelist ::= ident {`,´ ident}
 explist ::= {exp `,´} exp
 exp ::= unop exp | value [binop exp]
 functioncall ::= prefix {suffix} call
 args ::=  `(´ [explist] `)´ | tableconstructor | String
-function ::= function funcbody
+function ::= `function` funcbody
 funcbody ::= `(´ [parlist] `)´ block end
 parlist ::= namelist [`,´ `...´] | `...´
 tableconstructor ::= `{´ [fieldlist] `}´
 fieldlist ::= field {fieldsep field} [fieldsep]
-field ::= `[´ exp `]´ `=´ exp | IDENTIFIER `=´ exp | exp
+field ::= `[´ exp `]´ `=´ exp | ident `=´ exp | exp
 fieldsep ::= `,´ | `;´
 binop ::= `+´ | `-´ | `*´ | `/´ | `^´ | `%´ | `..´ |
           `<´ | `<=´ | `>´ | `>=´ | `==´ | `~=´ |
-          and | or
-unop ::= `-´ | not | `#´
-value ::= nil | false | true | Number | String | '...' | function |
-          tableconstructor | functioncall | var | '(' exp ')'
-prefix ::= '(' exp ')' | IDENTIFIER
-index ::= '[' exp ']' | '.' IDENTIFIER
-call ::= args | ':' IDENTIFIER args
+          `and` | `or`
+unop ::= `-´ | `not` | `#´
+value ::= `nil` | `false` | `true` | Number | String | `...` | function |
+          tableconstructor | functioncall | var | `(` exp `)`
+prefix ::= `(` exp `)` | ident
+index ::= `[` exp `]` | `.` ident
+call ::= args | `:` ident args
 suffix ::= call | index
 
