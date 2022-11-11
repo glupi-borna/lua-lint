@@ -688,7 +688,7 @@ class Statement_List extends AST_List<Statement> {
     static type = AST_NODE.STATEMENT_LIST;
 }
 
-type Statement = Assign | Func_Call | Do_Block | While | Repeat | If;
+type Statement = Assign | Func_Call | Do_Block | While | Repeat | If | For_In | For | Local_Var_Decl | Local_Func_Decl | Func_Decl;
 
 type DropFirst<T extends unknown[]> = T extends [any, ...infer U] ? U : never;
 type ReturnTypes<T> = {
@@ -780,10 +780,11 @@ class Parser {
         return this.ast_node(Num);
     }
 
-    symbol() {
+    symbol(): InstanceType<AST_SYMBOLS[keyof AST_SYMBOLS]> | undefined {
         this.skip_ws();
         if (this.at_end()) return undefined;
 
+        let node: AST_Node|undefined = undefined;
         switch (this.char()) {
             case "=":
             case "~":
@@ -791,27 +792,32 @@ class Parser {
             case ">":
                 if (this.char(1) == "=") {
                     this.move(2);
-                    return this.ast_node(Sym);
+                    node = this.ast_node(AST_Node);
                 } else if (this.char() != "~") {
                     this.move(1);
-                    return this.ast_node(Sym);
+                    node = this.ast_node(AST_Node);
                 }
                 break;
             case ".":
                 if (this.char(1) == ".") {
                     if (this.char(2) == ".") {
                         this.move(3);
-                        return this.ast_node(Sym);
+                        node = this.ast_node(AST_Node);
                     }
                     this.move(2);
-                    return this.ast_node(Sym);
+                    node = this.ast_node(AST_Node);
                 }
-                return this.ast_node(Sym);
+                node = this.ast_node(AST_Node);
         }
 
-        if (!SIMPLE_SYMBOLS.includes(this.char())) return undefined;
-        this.move();
-        return this.ast_node(Sym);
+        if (node === undefined && SIMPLE_SYMBOLS.includes(this.char())) {
+            node = this.ast_node(AST_Node);
+            this.move();
+        };
+
+        if (!node) return undefined;
+
+        return new AST_Symbols[node.text as keyof AST_SYMBOLS](this);
     }
 
     long_bracket<T extends AST_Node>(token_type: new (parser: Parser) => T) {
@@ -912,7 +918,7 @@ class Parser {
         if (this.at_end()) return undefined;
         let ident = this.ident();
         if (!ident) { return undefined; }
-        if (ident.type === AST_NODE.KEYWORD) { this.rollback(ident); return undefined; }
+        if (ident.text in AST_Keywords) { this.rollback(ident); return undefined; }
         return ident;
     }
 
@@ -988,17 +994,17 @@ class Parser {
         );
     }
 
-    keyword(): Keyword|undefined {
+    keyword(): InstanceType<AST_KEYWORDS[keyof AST_KEYWORDS]> | undefined {
         this.skip_ws();
         if (this.at_end()) return undefined;
 
         let ident = this.ident();
         if (!ident) { return undefined; }
-        if (!KEYWORDS.includes(ident.text)) {
+        if (!(ident.text in AST_Keywords)) {
             this.rollback(ident);
             return undefined;
         }
-        let kwd = new Keyword(this);
+        let kwd = new AST_Keywords[ident.text as keyof typeof AST_Keywords](this);
         kwd.withPos(ident);
         return kwd;
     }
