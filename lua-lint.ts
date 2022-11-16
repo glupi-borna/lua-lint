@@ -1,9 +1,5 @@
 import { readFileSync } from 'fs';
 
-type This<T extends new(...args: any) => any> = {
-	new(...args: ConstructorParameters<T>): any
-} & Pick<T, keyof T>;
-
 type Literal<LIT, TYPE> = TYPE extends LIT ? never : LIT;
 
 interface Char_Classifier {
@@ -77,13 +73,6 @@ class Position {
     }
 }
 
-const KEYWORDS = [
-    "and", "break", "do", "else", "elseif",
-    "end", "false", "for", "function", "if",
-    "in", "local", "nil", "not", "or",
-    "repeat", "return", "then", "true", "until", "while"
-];
-
 const SIMPLE_SYMBOLS = new Char_Classifiers(new Char_List("+-*/%^#<>=(){}[];:,."));
 
 enum AST_NODE {
@@ -147,6 +136,10 @@ class AST_Node {
 
     get text() {
         return this.parser.text.substring(this.start.index, this.end.index);
+    }
+
+    matches<T extends AST_Node>(node_type: new (...args: any) => T): this is T {
+        return this.type == (node_type as unknown as typeof AST_Node).type;
     }
 
     withPos(...tokens: (AST_Node|undefined)[]) {
@@ -244,15 +237,13 @@ function ast_class<
     ast_text: Literal<TEXT, string>,
     ast_type: Literal<AST, AST_NODE>,
 ) {
-    return class AST_Node_Simple extends AST_Node {
+    return class _ extends AST_Node {
         static literal = ast_text;
         static type = ast_type;
-
-        constructor(parser: Parser) { super(parser); }
-        static match<T extends This<typeof AST_Node_Simple>>(this: T, obj: any): obj is InstanceType<T> {
-            if (!(obj instanceof AST_Node)) return false;
-            return obj.text == this.literal && obj.type == this.type;
+        get type(): AST {
+            return _.type;
         }
+        constructor(parser: Parser) { super(parser); }
     };
 }
 
@@ -483,7 +474,7 @@ class Unary_Operation extends AST_Node {
 }
 
 /** '(' exp ')' | IDENTIFIER */
-type Prefix = Parens<Expr|Identifier>;
+type Prefix = Parens<Expr> | Identifier;
 type Suffix = Call|Index;
 
 class Dot_Access extends AST_Prefixed<AST_SYMBOL<".">, Identifier> {
@@ -510,7 +501,7 @@ class Method_Call extends AST_Node {
 type Call = Args | Method_Call;
 
 /** `(´ [explist] `)´ | tableconstructor | String */
-type Args = Parens<Expr_List|Table|Str>;
+type Args = Parens<Expr_List>|Table|Str;
 type Expr = Binary_Operation|Unary_Operation|Value;
 
 /** `{´ [fieldlist] `}´ */
@@ -892,6 +883,54 @@ class Parser {
         return out as any;
     }
 
+    parens<
+        FN extends (() => (AST_Node | undefined))
+    >(fn: FN): Parens<Exclude<ReturnType<FN>, undefined>> | undefined {
+        let seq = this.sequence(
+            () => this.exact_symbol("("),
+            fn,
+            () => this.exact_symbol(")")
+        );
+        if (!seq) { return undefined; }
+        return new Parens(this, {
+            open: seq[0],
+            value: seq[1] as Exclude<ReturnType<FN>, undefined>,
+            close: seq[2]
+        });
+    }
+
+    braces<
+        FN extends (() => (AST_Node | undefined))
+    >(fn: FN): Braces<Exclude<ReturnType<FN>, undefined>> | undefined {
+        let seq = this.sequence(
+            () => this.exact_symbol("{"),
+            fn,
+            () => this.exact_symbol("}")
+        );
+        if (!seq) { return undefined; }
+        return new Braces(this, {
+            open: seq[0],
+            value: seq[1] as Exclude<ReturnType<FN>, undefined>,
+            close: seq[2]
+        });
+    }
+
+    brackets<
+        FN extends (() => (AST_Node | undefined))
+    >(fn: FN): Brackets<Exclude<ReturnType<FN>, undefined>> | undefined {
+        let seq = this.sequence(
+            () => this.exact_symbol("["),
+            fn,
+            () => this.exact_symbol("]")
+        );
+        if (!seq) { return undefined; }
+        return new Brackets(this, {
+            open: seq[0],
+            value: seq[1] as Exclude<ReturnType<FN>, undefined>,
+            close: seq[2]
+        });
+    }
+
     either<
         FN extends (() => (AST_Node | undefined))[]
     >(
@@ -924,9 +963,9 @@ class Parser {
 
     unop(): Unary_Operator|undefined {
         let op = this.either(
-            () => this.exact(this.symbol, "-"),
-            () => this.exact(this.keyword, "not"),
-            () => this.exact(this.symbol, "#"),
+            () => this.exact_symbol("-"),
+            () => this.exact_keyword("not"),
+            () => this.exact_symbol("#"),
         );
         if (!op) return undefined;
         let u = new Unary_Operator(this);
@@ -934,23 +973,31 @@ class Parser {
         return u;
     }
 
+    exact_symbol<K extends keyof AST_SYMBOLS>(str: Literal<K, string>): AST_SYMBOL<K> {
+        return this.exact(this.symbol, str) as AST_SYMBOL<K>;
+    }
+
+    exact_keyword<K extends keyof AST_KEYWORDS>(str: Literal<K, string>): AST_KEYWORD<K> {
+        return this.exact(this.keyword, str) as AST_KEYWORD<K>;
+    }
+
     binop(): Binary_Operator|undefined {
         let op = this.either(
-            () => this.exact(this.symbol, "+"),
-            () => this.exact(this.symbol, "-"),
-            () => this.exact(this.symbol, "*"),
-            () => this.exact(this.symbol, "/"),
-            () => this.exact(this.symbol, "^"),
-            () => this.exact(this.symbol, "%"),
-            () => this.exact(this.symbol, ".."),
-            () => this.exact(this.symbol, "<"),
-            () => this.exact(this.symbol, ">"),
-            () => this.exact(this.symbol, "<="),
-            () => this.exact(this.symbol, ">="),
-            () => this.exact(this.symbol, "=="),
-            () => this.exact(this.symbol, "~="),
-            () => this.exact(this.keyword, "and"),
-            () => this.exact(this.keyword, "or"),
+            () => this.exact_symbol("+"),
+            () => this.exact_symbol("-"),
+            () => this.exact_symbol("*"),
+            () => this.exact_symbol("/"),
+            () => this.exact_symbol("^"),
+            () => this.exact_symbol("%"),
+            () => this.exact_symbol(".."),
+            () => this.exact_symbol("<"),
+            () => this.exact_symbol(">"),
+            () => this.exact_symbol("<="),
+            () => this.exact_symbol(">="),
+            () => this.exact_symbol("=="),
+            () => this.exact_symbol("~="),
+            () => this.exact_keyword("and"),
+            () => this.exact_keyword("or"),
         );
         if (!op) return undefined;
         let u = new Binary_Operator(this);
@@ -960,32 +1007,67 @@ class Parser {
 
     prefix(): Prefix|undefined {
         this.skip_ws();
-        if (this.at_end()) return undefined;
 
-        let pref = this.either(
-            this.variable,
-            () => {
-                let s = this.sequence(
-                    () => this.exact(this.symbol, "("),
-                    this.expr,
-                    () => this.exact(this.symbol, ")"),
-                );
-                if (s) return s[1];
-                return undefined;
-            }
+        return this.either(
+            () => this.parens(this.expr),
+            this.ident
         );
-
-        if (!pref) { return undefined; }
-        return this.ast_node(Prefix, pref);
     }
 
-    value() {
+    arg() {
+        return this.sequence(
+            () => this.exact_symbol(","),
+            this.expr
+        );
+    }
+
+    expr_list(): Expr_List|undefined {
+        this.skip_ws();
+        let first = this.expr();
+        let args: ReturnType<typeof this.arg>[] = [];
+        while (true) {
+            let arg = this.arg();
+            if (!arg) { break; }
+            args.push(arg);
+        }
+
+        ?
+        return new Expr_List(this, first, args);
+    }
+
+    args(): Args|undefined {
+        this.skip_ws();
         return this.either(
-            () => this.exact(this.keyword, "nil"),
-            () => this.exact(this.keyword, "false"),
-            () => this.exact(this.keyword, "true"),
+            this.str,
+            this.table,
+            () => this.parens(this.expr_list)
+        )
+    }
+
+    call(): Call|undefined {
+        this.skip_ws();
+        return this.either(
+            this.args,
+            this.method_call
+        )
+    }
+
+    suffix(): Suffix|undefined {
+        this.skip_ws();
+        return this.either(
+            this.call,
+            this.index
+        );
+    }
+
+    value(): Value|undefined {
+        return this.either(
+            () => this.exact_keyword("nil"),
+            () => this.exact_keyword("false"),
+            () => this.exact_keyword("true"),
             this.num, this.str,
-            () => this.exact(this.symbol, "...")
+            () => this.exact_symbol("..."),
+            () => this.parens(this.expr)
             // TODO: Function
             // TODO: TableConstructor
             // TODO: FunctionCall
@@ -1009,12 +1091,30 @@ class Parser {
         return kwd;
     }
 
-    expr(): Expr|undefined {
-        let val = this.value();
-        if (!val) { return undefined; }
+    binary_operation(): Binary_Operation|undefined {
+        this.skip_ws();
+        let seq = this.sequence(
+            this.value,
+            this.binop,
+            this.expr
+        );
+        if (!seq) return undefined;
+        return new Binary_Operation(this, ...seq);
+    }
 
-        let e = this.ast_node(Expr, val);
-        return e;
+    unary_operation(): Unary_Operation|undefined {
+        this.skip_ws();
+        let seq = this.sequence(this.unop, this.expr);
+        if (!seq) return undefined;
+        return new Unary_Operation(this, ...seq);
+    }
+
+    expr(): Expr|undefined {
+        return this.either(
+            this.binary_operation,
+            this.unary_operation,
+            this.value
+        );
     }
 
     list<K extends AST_Node>(fn: () => K|undefined): K[] {
@@ -1034,27 +1134,44 @@ class Parser {
         return tok;
     }
 
+    dot_access(): Dot_Access|undefined {
+        this.skip_ws();
+        let seq = this.sequence(
+            () => this.exact_symbol("."),
+            this.ident
+        );
+        if (!seq) return undefined;
+        return new Dot_Access(this, {
+            prefix: seq[0],
+            value: seq[1]
+        });
+    }
+
+    index(): Index|undefined {
+        this.skip_ws();
+        return this.either(
+            () => this.brackets(this.expr),
+            this.dot_access
+        )
+    }
+
+    index_access(): Index_Access {
+        this.skip_ws();
+        let prefix = this.prefix();
+        if (!prefix) return undefined;
+        let suffixes = this.list(this.suffix);
+        let index = this.index();
+
+        return new Index_Access(this, prefix, suffixes, index);
+    }
+
     variable(): Var|undefined {
         this.skip_ws();
-        if (this.at_end()) return undefined;
-
-        let prefix: Identifier|Prefix|undefined = this.name();
-        if (!prefix) {
-            return undefined;
-            prefix = this.prefix();
-            if (!prefix) { return undefined; }
-        }
-
-        let sym = this.symbol();
-        if (!sym || (sym.text != "." && sym.text != "[")) {
-            if (sym) { this.rollback(sym); }
-            return new Var(this, prefix);
-        }
-
-        let exp = this.name();
-        if (!exp) { this.rollback(prefix); return undefined; }
-
-        return new Var(this, prefix, exp);
+        let val = this.either(
+            this.ident
+        );
+        if (!val) return undefined;
+        return new Var(this, val);
     }
 
     parse() {
