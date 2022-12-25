@@ -1,341 +1,43 @@
+import { default as assert } from 'assert';
 import { readFileSync } from 'fs';
+import { LETTERS, DIGITS, IDENT_CHARS, SIMPLE_SYMBOLS } from './char';
+import { AST, Literal, Alternating_Array, No_Trailing_Array } from './ast_util';
 
-type Literal<LIT, TYPE> = TYPE extends LIT ? never : LIT;
-
-interface Char_Classifier {
-    includes(code: number): boolean;
+class Identifier extends AST.Node {
+    static type = AST.NODE.IDENTIFIER;
+    value = this.text;
 }
 
-class Char_Range {
-    start: number;
-    end: number;
-    constructor(range: string) {
-        this.start = range.charCodeAt(0);
-        this.end = range.charCodeAt(1);
-    }
-    includes(code: number) {
-        return code >= this.start && code <= this.end;
-    }
+class Num extends AST.Node {
+    static type = AST.NODE.NUMBER;
+    value = parseFloat(this.text);
 }
 
-class Char_List {
-    codes: number[];
-    constructor(chars: string) {
-        this.codes = chars.split("").map(c => c.charCodeAt(0));
-    }
-    includes(code: number) {
-        return this.codes.includes(code);
-    }
+class Str extends AST.Node {
+    static type = AST.NODE.STRING;
+    value = this.text;
 }
 
-class Char_Classifiers {
-    classifiers: Char_Classifier[];
-    constructor(...ranges: (string|Char_Classifier)[]) {
-        this.classifiers = ranges.map(r => typeof(r) === "string" ? new Char_Range(r) : r);
-    }
-    includes(char: string) {
-        let code = char.charCodeAt(0);
-        for (let range of this.classifiers) {
-            if (range.includes(code)) return true;
-        }
-        return false;
-    }
+class Unary_Operator extends AST.Node {
+    static type = AST.NODE.UNARY_OPERATOR;
+    private _ = undefined;
 }
 
-const LETTERS = new Char_Classifiers("az", "AZ");
-const DIGITS = new Char_Classifiers("09");
-const IDENT_CHARS = new Char_Classifiers(...LETTERS.classifiers, ...DIGITS.classifiers, "__");
-
-class Position {
-    readonly index: number;
-    readonly line: number;
-
-    constructor(idx: number, ln: number) {
-        this.index = idx;
-        this.line = ln;
-    }
-
-    copy() {
-        return new Position(this.index, this.line);
-    }
-
-    set(pos: Position) {
-        (this.index as number) = pos.index;
-        (this.line as number) = pos.line;
-    }
-
-    move(amt=1) {
-        (this.index as number) += amt;
-    }
-
-    nextLine() {
-        (this.line as number)++;
-    }
+class Binary_Operator extends AST.Node {
+    static type = AST.NODE.BINARY_OPERATOR;
+    private _ = undefined;
 }
 
-const SIMPLE_SYMBOLS = new Char_Classifiers(new Char_List("+-*/%^#<>=(){}[];:,."));
-
-enum AST_NODE {
-    IDENTIFIER, NUMBER, STRING, VAR, EXPR,
-
-    UNARY_OPERATOR, BINARY_OPERATOR,
-    UNARY_OPERATION, BINARY_OPERATION,
-
-    BLOCK, LAST_STATEMENT,
-    FUNC_NAME_NO_METHOD,
-    FUNC_CALL, FUNC, FUNC_BODY,
-    TABLE, DOT_ACCESS,
-    INDEX_ACCESS, METHOD_CALL,
-    PARENS, BRACES, BRACKETS, NAMED_FIELD,
-    RETURN, ASSIGN, SUFFIXES, METHOD_NAME, FUNC_NAME,
-    VAR_ARGS, PARAMS, FUNC_DECL, LOCAL_FUNC_DECL,
-    ASSIGN_EXPRS, LOCAL_VAR_DECL, FOR, FOR_STEP, FOR_IN,
-
-    STATEMENT_LIST, IDENTIFIER_LIST, VAR_LIST,
-    EXPR_LIST, FIELD_LIST_WITH_TRAILER, FIELD_LIST,
-    ELSEIF_LIST,
-
-    DO_BLOCK, WHILE, REPEAT, IF, ELSE, ELSEIF,
-
-    SYM_ADD, SYM_SUB, SYM_MUL, SYM_DIV, SYM_MOD,
-    SYM_EXP, SYM_LEN, SYM_LESS, SYM_MORE, SYM_ASSIGN,
-    SYM_EQUALS, SYM_NOT_EQUALS, SYM_LESS_EQUALS,
-    SYM_MORE_EQUALS, SYM_PAR_OPEN, SYM_PAR_CLOSE,
-    SYM_BRACE_OPEN, SYM_BRACE_CLOSE, SYM_BRACKET_OPEN,
-    SYM_BRACKET_CLOSE, SYM_CONCAT, SYM_DOT, SYM_COMMA,
-    SYM_COLON, SYM_SEMICOLON, SYM_DOTDOTDOT,
-
-    KWD_AND, KWD_BREAK, KWD_DO, KWD_ELSE, KWD_ELSEIF,
-    KWD_END, KWD_FALSE, KWD_FOR, KWD_FUNCTION, KWD_IF,
-    KWD_IN, KWD_LOCAL, KWD_NIL, KWD_NOT, KWD_OR,
-    KWD_REPEAT, KWD_RETURN, KWD_THEN, KWD_TRUE, KWD_UNTIL, KWD_WHILE,
-
-    UNKNOWN,
-};
-
-type AST_CLASS_MAP = Record<string, AST_NODE>;
-
-class AST_Node {
-    static type: AST_NODE = AST_NODE.UNKNOWN;
-    start: Position;
-    end: Position;
-
-    constructor(public parser: Parser) {
-        this.parser = parser;
-        this.start = parser.start.copy();
-        this.end = parser.current.copy();
-    }
-
-    get type() {
-        return (this.constructor as typeof AST_Node).type;
-    }
-
-    get kind() {
-        return AST_NODE[(this.constructor as typeof AST_Node).type];
-    }
-
-    get text() {
-        return this.parser.text.substring(this.start.index, this.end.index);
-    }
-
-    matches<T extends AST_Node>(node_type: new (...args: any) => T): this is T {
-        return this.type == (node_type as unknown as typeof AST_Node).type;
-    }
-
-    withPos(...tokens: (AST_Node|undefined)[]) {
-        let min_pos = this.start;
-        let max_pos = this.end;
-        for (let token of tokens) {
-            if (!token) continue;
-            if (token.start.index < min_pos.index) min_pos = token.start;
-            if (token.end.index > max_pos.index) max_pos = token.end;
-        }
-        this.start.set(min_pos);
-        this.end.set(max_pos);
-        return this;
-    }
-
-    keys() {
-        return Object.keys(this).
-            concat("text", "kind").
-            filter(k => ![
-                "parser", "start", "end", "type"
-            ].includes(k)
-        );
-    }
-
-    toString() {
-        let n = this.constructor.name;
-        let props = this.keys().map((p) => `${p}: ${(this as any)[p]}`).join(", ");
-        return `${n}(${props})`;
-    }
+class Parens<T extends AST.Node> extends AST.Wrapped<AST.SYMBOL<"(">, T, AST.SYMBOL<")">> {
+    static type = AST.NODE.PARENS;
 }
 
-abstract class AST_Wrapper<T extends AST_Node> extends AST_Node {
-    constructor(parser: Parser, public value: T) {
-        super(parser);
-        this.withPos(value);
-    }
+class Braces<T extends AST.Node> extends AST.Wrapped<AST.SYMBOL<"{">, T, AST.SYMBOL<"}">> {
+    static type = AST.NODE.BRACES;
 }
 
-abstract class AST_Sequence<T extends Record<string, AST_Node>> extends AST_Node {
-    constructor(
-        parser: Parser,
-        public fields: T
-    ) {
-        super(parser);
-        this.withPos(...Object.values(fields));
-    }
-}
-
-abstract class AST_Wrapped<
-    OPEN extends AST_Node,
-    T extends AST_Node,
-    CLOSE extends AST_Node
-> extends AST_Sequence<{
-    open: OPEN,
-    value: T,
-    close: CLOSE
-}> {}
-
-abstract class AST_Prefixed<
-    PREFIX extends AST_Node,
-    T extends AST_Node
-> extends AST_Sequence<{
-    prefix: PREFIX,
-    value: T
-}> {}
-
-abstract class AST_List<T extends AST_Node> extends AST_Node {
-    constructor(
-        parser: Parser,
-        public list: T[]
-    ) {
-        super(parser);
-        this.withPos(...list);
-    }
-}
-
-abstract class AST_Delimited<T extends AST_Node, DELIMITER extends AST_Node> extends AST_List<T> {
-    constructor(
-        parser: Parser,
-        first?: T,
-        ...args: AST_Prefixed<DELIMITER, T>[]
-    ) {
-        let ts: T[] = [];
-        if (first) ts.push(first);
-        for (let arg of args) ts.push(arg.fields.value);
-        super(parser, ts);
-        this.withPos(first, ...args);
-    }
-}
-
-function ast_class<
-    TEXT extends string,
-    AST extends AST_NODE
->(
-    ast_text: Literal<TEXT, string>,
-    ast_type: Literal<AST, AST_NODE>,
-) {
-    return class _ extends AST_Node {
-        static literal = ast_text;
-        static type = ast_type;
-        get type(): AST {
-            return _.type;
-        }
-        constructor(parser: Parser) { super(parser); }
-    };
-}
-
-function ast_class_map<
-    T extends AST_CLASS_MAP
->(
-    obj: Literal<T, AST_CLASS_MAP>
-): {
-    [KEY in keyof T]: KEY extends string ? ReturnType<typeof ast_class<KEY, T[KEY]>> : never
-} {
-    let out = {} as any;
-    for (let key in obj) {
-        out[key] = (ast_class as any)(key, obj[key]);
-    }
-    return out as ReturnType<typeof ast_class_map<T>>;
-}
-
-
-const AST_Keywords = ast_class_map({
-    "and": AST_NODE.KWD_AND,
-    "break": AST_NODE.KWD_BREAK,
-    "do": AST_NODE.KWD_DO,
-    "else": AST_NODE.KWD_ELSE,
-    "elseif": AST_NODE.KWD_ELSEIF,
-    "end": AST_NODE.KWD_END,
-    "false": AST_NODE.KWD_FALSE,
-    "for": AST_NODE.KWD_FOR,
-    "function": AST_NODE.KWD_FUNCTION,
-    "if": AST_NODE.KWD_IF,
-    "in": AST_NODE.KWD_IN,
-    "local": AST_NODE.KWD_LOCAL,
-    "nil": AST_NODE.KWD_NIL,
-    "not": AST_NODE.KWD_NOT,
-    "or": AST_NODE.KWD_OR,
-    "repeat": AST_NODE.KWD_REPEAT,
-    "return": AST_NODE.KWD_RETURN,
-    "then": AST_NODE.KWD_THEN,
-    "true": AST_NODE.KWD_TRUE,
-    "until": AST_NODE.KWD_UNTIL,
-    "while": AST_NODE.KWD_WHILE,
-});
-type AST_KEYWORDS = typeof AST_Keywords;
-type AST_KEYWORD<T extends keyof AST_KEYWORDS> = InstanceType<typeof AST_Keywords[T]>;
-
-const AST_Symbols = ast_class_map({
-    "+": AST_NODE.SYM_ADD,
-    "-": AST_NODE.SYM_SUB,
-    "*": AST_NODE.SYM_MUL,
-    "/": AST_NODE.SYM_DIV,
-    "%": AST_NODE.SYM_MOD,
-    "^": AST_NODE.SYM_EXP,
-    "#": AST_NODE.SYM_LEN,
-    "<": AST_NODE.SYM_LESS,
-    ">": AST_NODE.SYM_MORE,
-    "=": AST_NODE.SYM_ASSIGN,
-    "==": AST_NODE.SYM_EQUALS,
-    "~=": AST_NODE.SYM_NOT_EQUALS,
-    "<=": AST_NODE.SYM_LESS_EQUALS,
-    ">=": AST_NODE.SYM_MORE_EQUALS,
-    "(": AST_NODE.SYM_PAR_OPEN,
-    ")": AST_NODE.SYM_PAR_CLOSE,
-    "{": AST_NODE.SYM_BRACE_OPEN,
-    "}": AST_NODE.SYM_BRACE_CLOSE,
-    "[": AST_NODE.SYM_BRACKET_OPEN,
-    "]": AST_NODE.SYM_BRACKET_CLOSE,
-    "..": AST_NODE.SYM_CONCAT,
-    ".": AST_NODE.SYM_DOT,
-    ",": AST_NODE.SYM_COMMA,
-    ":": AST_NODE.SYM_COLON,
-    ";": AST_NODE.SYM_SEMICOLON,
-    "...": AST_NODE.SYM_DOTDOTDOT,
-});
-type AST_SYMBOLS = typeof AST_Symbols;
-type AST_SYMBOL<T extends keyof AST_SYMBOLS> = InstanceType<typeof AST_Symbols[T]>;
-
-class Identifier extends AST_Node { static type = AST_NODE.IDENTIFIER; }
-class Num extends AST_Node { static type = AST_NODE.NUMBER; }
-class Str extends AST_Node { static type = AST_NODE.STRING; }
-
-class Unary_Operator extends AST_Node { static type = AST_NODE.UNARY_OPERATOR; }
-class Binary_Operator extends AST_Node { static type = AST_NODE.BINARY_OPERATOR; }
-
-class Parens<T extends AST_Node> extends AST_Wrapped<AST_SYMBOL<"(">, T, AST_SYMBOL<")">> {
-    static type = AST_NODE.PARENS;
-}
-
-class Braces<T extends AST_Node> extends AST_Wrapped<AST_SYMBOL<"{">, T, AST_SYMBOL<"}">> {
-    static type = AST_NODE.BRACES;
-}
-
-class Brackets<T extends AST_Node> extends AST_Wrapped<AST_SYMBOL<"[">, T, AST_SYMBOL<"]">> {
-    static type = AST_NODE.BRACKETS;
+class Brackets<T extends AST.Node> extends AST.Wrapped<AST.SYMBOL<"[">, T, AST.SYMBOL<"]">> {
+    static type = AST.NODE.BRACKETS;
 }
 
 /**
@@ -344,44 +46,57 @@ String | '...' | function |
 tableconstructor | functioncall |
 var | '(' exp ')'
 */
-type Value = AST_KEYWORD<"nil"> | AST_KEYWORD<"false"> | AST_KEYWORD<"true"> |
-    Num | Str | AST_SYMBOL<"..."> | Func | Table |
+type Value = AST.KEYWORD<"nil"> | AST.KEYWORD<"false"> | AST.KEYWORD<"true"> |
+    Num | Str | AST.SYMBOL<"..."> | Func | Table |
     Func_Call | Var | Parens<Expr>;
 
-
-class Suffixes extends AST_List<Suffix> {
-    static type = AST_NODE.SUFFIXES;
+function is_value(o: any): o is Value {
+    return AST.is_any(o,
+        AST.Keywords["nil"],
+        AST.Keywords["false"],
+        AST.Keywords["true"],
+        AST.Symbols["..."],
+        Func, Table, Var,
+        Func_Call, Str, Num
+    ) || (
+        AST.is(o, Parens) && is_expr(o.fields.value)
+    );
 }
 
-class Func_Call extends AST_Sequence<{
+
+class Suffixes extends AST.List<Suffix> {
+    static type = AST.NODE.SUFFIXES;
+}
+
+class Func_Call extends AST.Sequence<{
     prefix: Prefix,
     suffixes: Suffixes,
     call: Call
 }> {
-    static type = AST_NODE.FUNC_CALL;
+    static type = AST.NODE.FUNC_CALL;
 }
 
-class Func_Name_No_Method extends AST_Delimited<Identifier, AST_SYMBOL<".">> {
-    static type = AST_NODE.FUNC_NAME_NO_METHOD;
+class Func_Name_No_Method extends AST.Delimited<Identifier, AST.SYMBOL<".">> {
+    static type = AST.NODE.FUNC_NAME_NO_METHOD;
 }
 
-class Method_Name extends AST_Sequence<{
-    colon: AST_SYMBOL<":">;
+class Method_Name extends AST.Sequence<{
+    colon: AST.SYMBOL<":">;
     name: Identifier;
 }> {
-    static type = AST_NODE.METHOD_NAME;
+    static type = AST.NODE.METHOD_NAME;
 }
 
-class Func_Name extends AST_Sequence<{
+class Func_Name extends AST.Sequence<{
     name: Func_Name_No_Method,
     method?: Method_Name
 }> {
-    static type = AST_NODE.FUNC_NAME;
+    static type = AST.NODE.FUNC_NAME;
 }
 
 /** prefix {suffix} index */
-class Index_Access extends AST_Node {
-    static type = AST_NODE.INDEX_ACCESS;
+class Index_Access extends AST.Node {
+    static type = AST.NODE.INDEX_ACCESS;
     constructor(
         parser: Parser,
         public prefix: Prefix,
@@ -394,60 +109,60 @@ class Index_Access extends AST_Node {
 }
 
 /** 'function' functionbody */
-class Func extends AST_Sequence<{
-    keyword: AST_KEYWORD<"function">,
+class Func extends AST.Sequence<{
+    keyword: AST.KEYWORD<"function">,
     body: Func_Body
 }> {
-    static type = AST_NODE.FUNC;
+    static type = AST.NODE.FUNC;
 
 }
 
 /** {stat [`;´]} [laststat [`;´]] */
-class Block extends AST_Sequence<{
+class Block extends AST.Sequence<{
     statements: Statement_List,
     last_statement?: Last_Statement
 }> {
-    static type = AST_NODE.BLOCK;
+    static type = AST.NODE.BLOCK;
 }
 
-class Identifier_List extends AST_Delimited<Identifier, AST_SYMBOL<",">> {
-    static type = AST_NODE.IDENTIFIER_LIST;
+class Identifier_List extends AST.Delimited<Identifier, AST.SYMBOL<",">> {
+    static type = AST.NODE.IDENTIFIER_LIST;
 }
 
-class Var_List extends AST_Delimited<Var, AST_SYMBOL<",">> {
-    static type = AST_NODE.VAR_LIST;
+class Var_List extends AST.Delimited<Var, AST.SYMBOL<",">> {
+    static type = AST.NODE.VAR_LIST;
 }
 
-class Expr_List extends AST_Delimited<Expr, AST_SYMBOL<",">> {
-    static type = AST_NODE.EXPR_LIST;
+class Expr_List extends AST.Delimited<Expr, AST.SYMBOL<",">> {
+    static type = AST.NODE.EXPR_LIST;
 }
 
-class Var_Args extends AST_Prefixed<AST_SYMBOL<",">, AST_SYMBOL<"...">> {
-    static type = AST_NODE.VAR_ARGS;
+class Var_Args extends AST.Prefixed<AST.SYMBOL<",">, AST.SYMBOL<"...">> {
+    static type = AST.NODE.VAR_ARGS;
 }
 
-class Param_List extends AST_Sequence<{
+class Param_List extends AST.Sequence<{
     params: Identifier_List,
     varargs?: Var_Args
 }> {
-    static type = AST_NODE.PARAMS;
+    static type = AST.NODE.PARAMS;
 }
 
-type Params = AST_SYMBOL<"..."> | Param_List;
+type Params = AST.SYMBOL<"..."> | Param_List;
 
 /** `(´ [parlist] `)´ block end */
-class Func_Body extends AST_Sequence<{
+class Func_Body extends AST.Sequence<{
     params: Parens<Params>,
     body: Block,
-    end: AST_KEYWORD<"end">
+    end: AST.KEYWORD<"end">
 }> {
-    static type = AST_NODE.FUNC_BODY;
+    static type = AST.NODE.FUNC_BODY;
 }
 
-class Var extends AST_Wrapper<Index_Access|Identifier> { static type = AST_NODE.VAR; }
+class Var extends AST.Wrapper<Index_Access|Identifier> { static type = AST.NODE.VAR; }
 
-class Binary_Operation extends AST_Node {
-    static type = AST_NODE.BINARY_OPERATION;
+class Binary_Operation extends AST.Node {
+    static type = AST.NODE.BINARY_OPERATION;
 
     constructor(
         parser: Parser,
@@ -460,8 +175,8 @@ class Binary_Operation extends AST_Node {
     }
 }
 
-class Unary_Operation extends AST_Node {
-    static type = AST_NODE.UNARY_OPERATION;
+class Unary_Operation extends AST.Node {
+    static type = AST.NODE.UNARY_OPERATION;
 
     constructor(
         parser: Parser,
@@ -477,16 +192,16 @@ class Unary_Operation extends AST_Node {
 type Prefix = Parens<Expr> | Identifier;
 type Suffix = Call|Index;
 
-class Dot_Access extends AST_Prefixed<AST_SYMBOL<".">, Identifier> {
-    static type = AST_NODE.DOT_ACCESS;
+class Dot_Access extends AST.Prefixed<AST.SYMBOL<".">, Identifier> {
+    static type = AST.NODE.DOT_ACCESS;
 }
 
 /** '[' exp ']' | '.' IDENTIFIER */
 type Index = Brackets<Expr> | Dot_Access;
 
 /** ':' IDENTIFIER args */
-class Method_Call extends AST_Node {
-    static type = AST_NODE.METHOD_CALL;
+class Method_Call extends AST.Node {
+    static type = AST.NODE.METHOD_CALL;
     constructor(
         parser: Parser,
         public method: Method_Name,
@@ -503,17 +218,20 @@ type Call = Args | Method_Call;
 /** `(´ [explist] `)´ | tableconstructor | String */
 type Args = Parens<Expr_List>|Table|Str;
 type Expr = Binary_Operation|Unary_Operation|Value;
+function is_expr(o: any): o is Expr {
+    return AST.is_any(o, Binary_Operation, Unary_Operation) || is_value(o);
+}
 
 /** `{´ [fieldlist] `}´ */
-class Table extends Braces<Field_List_With_Trailer> { static type = AST_NODE.TABLE; }
+class Table extends Braces<Field_List> { static type = AST.NODE.TABLE; }
 
-class Named_Field extends AST_Node {
-    static type = AST_NODE.NAMED_FIELD;
+class Named_Field extends AST.Node {
+    static type = AST.NODE.NAMED_FIELD;
 
     constructor(
         parser: Parser,
         public name: Brackets<Expr> | Identifier,
-        public equals: AST_SYMBOL<"=">,
+        public equals: AST.SYMBOL<"=">,
         public expression: Expr
     ) {
         super(parser);
@@ -522,161 +240,155 @@ class Named_Field extends AST_Node {
 }
 
 type Field = Named_Field|Expr;
-type Field_Sep = AST_SYMBOL<","> | AST_SYMBOL<";">;
+type Field_Sep = AST.SYMBOL<","> | AST.SYMBOL<";">;
 
-class Field_List extends AST_Delimited<Field, Field_Sep> {
-    static type = AST_NODE.FIELD_LIST;
+class Field_List extends AST.Delimited_Trailing<Field, Field_Sep> {
+    static type = AST.NODE.FIELD_LIST;
 }
 
-class Field_List_With_Trailer extends AST_Sequence<{
-    field_list: Field_List,
-    trailer?: Field_Sep
+class Return_Statement extends AST.Prefixed<AST.KEYWORD<"return">, Expr> {
+    static type = AST.NODE.RETURN;
+}
+
+class Last_Statement extends AST.Sequence<{
+    statement: Return_Statement | AST.KEYWORD<"break">
+    semicolon?: AST.SYMBOL<";">
 }> {
-    static type = AST_NODE.FIELD_LIST_WITH_TRAILER;
+    static type = AST.NODE.LAST_STATEMENT;
 }
 
-class Return_Statement extends AST_Prefixed<AST_KEYWORD<"return">, Expr> {
-    static type = AST_NODE.RETURN;
-}
-
-class Last_Statement extends AST_Sequence<{
-    statement: Return_Statement | AST_KEYWORD<"break">
-    semicolon?: AST_SYMBOL<";">
-}> {
-    static type = AST_NODE.LAST_STATEMENT;
-}
-
-class Assign extends AST_Sequence<{
+class Assign extends AST.Sequence<{
     vars: Var_List,
-    exprs: Assign_Exprs
+    equals: AST.SYMBOL<"=">,
+    exprs: Expr_List
 }> {
-    static type = AST_NODE.ASSIGN;
+    static type = AST.NODE.ASSIGN;
 }
 
-class Do_Block extends AST_Sequence<{
-    do: AST_KEYWORD<"do">,
+class Do_Block extends AST.Sequence<{
+    do: AST.KEYWORD<"do">,
     block: Block,
-    end: AST_KEYWORD<"end">
+    end: AST.KEYWORD<"end">
 }> {
-    static type = AST_NODE.DO_BLOCK;
+    static type = AST.NODE.DO_BLOCK;
 }
 
-class While extends AST_Sequence<{
-    while_keyword: AST_KEYWORD<"while">,
+class While extends AST.Sequence<{
+    while_keyword: AST.KEYWORD<"while">,
     condition: Expr,
-    do_keyword: AST_KEYWORD<"do">,
+    do_keyword: AST.KEYWORD<"do">,
     block: Block,
-    end_keyword: AST_KEYWORD<"end">
+    end_keyword: AST.KEYWORD<"end">
 }> {
-    static type = AST_NODE.WHILE;
+    static type = AST.NODE.WHILE;
 }
 
-class Repeat extends AST_Sequence<{
-    repeat_keyword: AST_KEYWORD<"repeat">,
+class Repeat extends AST.Sequence<{
+    repeat_keyword: AST.KEYWORD<"repeat">,
     block: Block,
-    until_keyword: AST_KEYWORD<"until">,
+    until_keyword: AST.KEYWORD<"until">,
     condition: Expr
 }> {
-    static type = AST_NODE.REPEAT;
+    static type = AST.NODE.REPEAT;
 }
 
-class If extends AST_Sequence<{
-    if_keyword: AST_KEYWORD<"if">,
+class If extends AST.Sequence<{
+    if_keyword: AST.KEYWORD<"if">,
     condition: Expr,
-    then_keyword: AST_KEYWORD<"then">,
+    then_keyword: AST.KEYWORD<"then">,
     block: Block,
     elseifs?: ElseIf_List,
     Else?: Else
-    end_keyword: AST_KEYWORD<"end">,
+    end_keyword: AST.KEYWORD<"end">,
 
 }> {
-    static type = AST_NODE.IF;
+    static type = AST.NODE.IF;
 }
 
-class Else extends AST_Sequence<{
-    else_keyword: AST_KEYWORD<"else">,
+class Else extends AST.Sequence<{
+    else_keyword: AST.KEYWORD<"else">,
     block: Block
 }> {
-    static type = AST_NODE.ELSE;
+    static type = AST.NODE.ELSE;
 }
 
-class ElseIf extends AST_Sequence<{
-    elseif_keyword: AST_KEYWORD<"elseif">,
+class ElseIf extends AST.Sequence<{
+    elseif_keyword: AST.KEYWORD<"elseif">,
     condition: Expr,
-    then_keyword: AST_KEYWORD<"then">,
+    then_keyword: AST.KEYWORD<"then">,
     block: Block
 }> {
-    static type = AST_NODE.ELSEIF;
+    static type = AST.NODE.ELSEIF;
 }
 
-class ElseIf_List extends AST_List<ElseIf> {
-    static type = AST_NODE.ELSEIF_LIST;
+class ElseIf_List extends AST.List<ElseIf> {
+    static type = AST.NODE.ELSEIF_LIST;
 }
 
-class Func_Decl extends AST_Sequence<{
-    func_keyword: AST_KEYWORD<"function">,
+class Func_Decl extends AST.Sequence<{
+    func_keyword: AST.KEYWORD<"function">,
     name: Func_Name,
     body: Func_Body
 }> {
-    static type = AST_NODE.FUNC_DECL;
+    static type = AST.NODE.FUNC_DECL;
 }
 
-class Local_Func_Decl extends AST_Sequence<{
-    local_keyword: AST_KEYWORD<"local">,
-    func_keyword: AST_KEYWORD<"function">,
+class Local_Func_Decl extends AST.Sequence<{
+    local_keyword: AST.KEYWORD<"local">,
+    func_keyword: AST.KEYWORD<"function">,
     name: Identifier,
     body: Func_Body
 }> {
-    static type = AST_NODE.LOCAL_FUNC_DECL;
+    static type = AST.NODE.LOCAL_FUNC_DECL;
 }
 
-class Assign_Exprs extends AST_Sequence<{
-    "assign": AST_SYMBOL<"=">,
+class Assign_Exprs extends AST.Sequence<{
+    "assign": AST.SYMBOL<"=">,
     "exprs": Expr_List
 }> {
-    static type = AST_NODE.ASSIGN_EXPRS;
+    static type = AST.NODE.ASSIGN_EXPRS;
 }
 
-class Local_Var_Decl extends AST_Sequence<{
-    local_keyword: AST_KEYWORD<"local">,
+class Local_Var_Decl extends AST.Sequence<{
+    local_keyword: AST.KEYWORD<"local">,
     names: Identifier_List,
     exprs?: Assign_Exprs
 }> {
-    static type = AST_NODE.LOCAL_VAR_DECL;
+    static type = AST.NODE.LOCAL_VAR_DECL;
 }
 
-class For extends AST_Sequence<{
-    for_keyword: AST_KEYWORD<"for">,
+class For extends AST.Sequence<{
+    for_keyword: AST.KEYWORD<"for">,
     name: Identifier,
-    assign: AST_SYMBOL<"=">,
+    assign: AST.SYMBOL<"=">,
     init: Expr,
-    comma: AST_SYMBOL<",">,
+    comma: AST.SYMBOL<",">,
     end: Expr,
     step?: For_Step,
     block: Do_Block
 }> {
-    static type = AST_NODE.FOR;
+    static type = AST.NODE.FOR;
 }
 
-class For_Step extends AST_Sequence<{
-    comma: AST_SYMBOL<",">,
+class For_Step extends AST.Sequence<{
+    comma: AST.SYMBOL<",">,
     step: Expr
 }> {
-    static type = AST_NODE.FOR_STEP;
+    static type = AST.NODE.FOR_STEP;
 }
 
-class For_In extends AST_Sequence<{
-    for_keyword: AST_KEYWORD<"for">,
+class For_In extends AST.Sequence<{
+    for_keyword: AST.KEYWORD<"for">,
     names: Identifier_List,
-    in_keyword: AST_KEYWORD<"in">,
+    in_keyword: AST.KEYWORD<"in">,
     exprs: Expr_List,
     block: Do_Block
 }> {
-    static type = AST_NODE.FOR_IN;
+    static type = AST.NODE.FOR_IN;
 }
 
-class Statement_List extends AST_List<Statement> {
-    static type = AST_NODE.STATEMENT_LIST;
+class Statement_List extends AST.List<Statement> {
+    static type = AST.NODE.STATEMENT_LIST;
 }
 
 type Statement = Assign | Func_Call | Do_Block | While | Repeat | If | For_In | For | Local_Var_Decl | Local_Func_Decl | Func_Decl;
@@ -691,8 +403,8 @@ type RequiredTypes<T> = {
 
 class Parser {
     text: string;
-    start = new Position(0, 0);
-    current = new Position(0, 0);
+    start = new AST.Position(0, 0);
+    current = new AST.Position(0, 0);
 
     constructor(text: string) {
         this.text = text;
@@ -700,18 +412,18 @@ class Parser {
 
     char(add=0) { return this.text[this.current.index+add]; }
     move(amt=1) { this.current.move(amt); }
-    rollback(token?: AST_Node) { this.current.set((token||this).start); }
+    rollback(token?: AST.Node) { this.current.set((token||this).start); }
     at_end() { return this.current.index >= this.text.length; }
 
     ast_node<
-        T extends AST_Node,
+        T extends AST.Node,
         FN extends new (...args: any) => T,
     >(
         cls: FN,
         ...args: DropFirst<ConstructorParameters<FN>>
     ): InstanceType<typeof cls> {
         let t = new cls(this, ...args);
-        this.start = this.current;
+        this.start = this.current.copy();
         return t as any;
     }
 
@@ -732,7 +444,7 @@ class Parser {
                 case "-":
                     if (this.char(1) == "-") {
                         this.move(2);
-                        if (!this.long_bracket(AST_Node)) {
+                        if (!this.long_bracket(AST.Node)) {
                             this.move(-2);
                             while (this.char() != "\n" && !this.at_end()) this.move();
                         }
@@ -771,11 +483,11 @@ class Parser {
         return this.ast_node(Num);
     }
 
-    symbol(): InstanceType<AST_SYMBOLS[keyof AST_SYMBOLS]> | undefined {
+    symbol(): InstanceType<AST.SYMBOLS[keyof AST.SYMBOLS]> | undefined {
         this.skip_ws();
         if (this.at_end()) return undefined;
 
-        let node: AST_Node|undefined = undefined;
+        let node: AST.Node|undefined = undefined;
         switch (this.char()) {
             case "=":
             case "~":
@@ -783,35 +495,34 @@ class Parser {
             case ">":
                 if (this.char(1) == "=") {
                     this.move(2);
-                    node = this.ast_node(AST_Node);
+                    node = this.ast_node(AST.Node);
                 } else if (this.char() != "~") {
                     this.move(1);
-                    node = this.ast_node(AST_Node);
+                    node = this.ast_node(AST.Node);
                 }
                 break;
             case ".":
                 if (this.char(1) == ".") {
                     if (this.char(2) == ".") {
                         this.move(3);
-                        node = this.ast_node(AST_Node);
+                        node = this.ast_node(AST.Node);
                     }
                     this.move(2);
-                    node = this.ast_node(AST_Node);
+                    node = this.ast_node(AST.Node);
                 }
-                node = this.ast_node(AST_Node);
+                node = this.ast_node(AST.Node);
         }
 
         if (node === undefined && SIMPLE_SYMBOLS.includes(this.char())) {
-            node = this.ast_node(AST_Node);
+            node = this.ast_node(AST.Node);
             this.move();
         };
 
         if (!node) return undefined;
-
-        return new AST_Symbols[node.text as keyof AST_SYMBOLS](this);
+        return new AST.Symbols[node.text as keyof AST.SYMBOLS](this);
     }
 
-    long_bracket<T extends AST_Node>(token_type: new (parser: Parser) => T) {
+    long_bracket<T extends AST.Node>(token_type: new (parser: Parser) => T) {
         this.skip_ws();
         if (this.at_end()) return undefined;
         if (this.char() != "[") return undefined;
@@ -870,7 +581,7 @@ class Parser {
     }
 
     sequence<
-        FN extends (() => (AST_Node | undefined))[]
+        FN extends (() => (AST.Node | undefined))[]
     >(
         ...fns: FN
     ): RequiredTypes<ReturnTypes<typeof fns>>|undefined {
@@ -884,7 +595,7 @@ class Parser {
     }
 
     parens<
-        FN extends (() => (AST_Node | undefined))
+        FN extends (() => (AST.Node | undefined))
     >(fn: FN): Parens<Exclude<ReturnType<FN>, undefined>> | undefined {
         let seq = this.sequence(
             () => this.exact_symbol("("),
@@ -900,7 +611,7 @@ class Parser {
     }
 
     braces<
-        FN extends (() => (AST_Node | undefined))
+        FN extends (() => (AST.Node | undefined))
     >(fn: FN): Braces<Exclude<ReturnType<FN>, undefined>> | undefined {
         let seq = this.sequence(
             () => this.exact_symbol("{"),
@@ -916,7 +627,7 @@ class Parser {
     }
 
     brackets<
-        FN extends (() => (AST_Node | undefined))
+        FN extends (() => (AST.Node | undefined))
     >(fn: FN): Brackets<Exclude<ReturnType<FN>, undefined>> | undefined {
         let seq = this.sequence(
             () => this.exact_symbol("["),
@@ -931,8 +642,23 @@ class Parser {
         });
     }
 
+    exact<K extends AST.Node>(fn: ()=>K|undefined, text: string): K|undefined {
+        let tok = fn.call(this);
+        if (!tok) return undefined;
+        if (tok.text !== text) { this.rollback(tok); return undefined; }
+        return tok;
+    }
+
+    exact_symbol<K extends keyof AST.SYMBOLS>(str: Literal<K, string>): AST.SYMBOL<K>|undefined {
+        return this.exact(this.symbol, str) as AST.SYMBOL<K>|undefined;
+    }
+
+    exact_keyword<K extends keyof AST.KEYWORDS>(str: Literal<K, string>): AST.KEYWORD<K>|undefined {
+        return this.exact(this.keyword, str) as AST.KEYWORD<K>|undefined;
+    }
+
     either<
-        FN extends (() => (AST_Node | undefined))[]
+        FN extends (() => (AST.Node | undefined))[]
     >(
         ...fns: FN
     ): ReturnTypes<typeof fns>[number] | undefined {
@@ -945,11 +671,65 @@ class Parser {
         return undefined;
     }
 
+    alternating<
+        FNA extends (() => (AST.Node | undefined)),
+        FNB extends (() => (AST.Node | undefined))
+    >(
+        fn_a: FNA,
+        fn_b: FNB
+    ) {
+        this.skip_ws();
+        let first = fn_a();
+        if (!first) { return undefined; }
+        let args = [first];
+        while (true) {
+            let b = fn_b();
+            if (!b) break;
+            args.push(b);
+            let a = fn_a();
+            if (!a) break;
+            args.push(a);
+        }
+
+        return args as unknown as Alternating_Array<
+            NonNullable<ReturnType<FNA>>,
+            NonNullable<ReturnType<FNB>>
+        >;
+    }
+
+    no_trailing<
+        FNA extends (() => (AST.Node | undefined)),
+        FNB extends (() => (AST.Node | undefined))
+    >(
+        fn_a: FNA,
+        fn_b: FNB
+    ) {
+        this.skip_ws();
+        let first = fn_a();
+        if (!first) { return undefined; }
+        let args = [first];
+        while (true) {
+            let b = fn_b();
+            if (!b) break;
+            let a = fn_a();
+            if (!a) {
+                this.rollback(first);
+                return undefined
+            };
+            args.push(b, a);
+        }
+
+        return args as unknown as No_Trailing_Array<
+            NonNullable<ReturnType<FNA>>,
+            NonNullable<ReturnType<FNB>>
+        >;
+    }
+
     other() {
         this.skip_ws();
         if (this.at_end()) return undefined;
         this.move();
-        return this.ast_node(AST_Node);
+        return this.ast_node(AST.Node);
     }
 
     name() {
@@ -957,7 +737,7 @@ class Parser {
         if (this.at_end()) return undefined;
         let ident = this.ident();
         if (!ident) { return undefined; }
-        if (ident.text in AST_Keywords) { this.rollback(ident); return undefined; }
+        if (ident.text in AST.Keywords) { this.rollback(ident); return undefined; }
         return ident;
     }
 
@@ -971,14 +751,6 @@ class Parser {
         let u = new Unary_Operator(this);
         u.withPos(op);
         return u;
-    }
-
-    exact_symbol<K extends keyof AST_SYMBOLS>(str: Literal<K, string>): AST_SYMBOL<K> {
-        return this.exact(this.symbol, str) as AST_SYMBOL<K>;
-    }
-
-    exact_keyword<K extends keyof AST_KEYWORDS>(str: Literal<K, string>): AST_KEYWORD<K> {
-        return this.exact(this.keyword, str) as AST_KEYWORD<K>;
     }
 
     binop(): Binary_Operator|undefined {
@@ -1006,33 +778,62 @@ class Parser {
     }
 
     prefix(): Prefix|undefined {
-        this.skip_ws();
-
         return this.either(
             () => this.parens(this.expr),
             this.ident
         );
     }
 
-    arg() {
-        return this.sequence(
-            () => this.exact_symbol(","),
-            this.expr
+    suffix(): Suffix|undefined {
+        return this.either(
+            this.call,
+            this.index
         );
     }
 
     expr_list(): Expr_List|undefined {
-        this.skip_ws();
-        let first = this.expr();
-        let args: ReturnType<typeof this.arg>[] = [];
-        while (true) {
-            let arg = this.arg();
-            if (!arg) { break; }
-            args.push(arg);
-        }
+        let exprs = this.no_trailing(this.expr, () => this.exact_symbol(","));
+        if (!exprs) return undefined;
+        return new Expr_List(this, exprs);
+    }
 
-        ?
-        return new Expr_List(this, first, args);
+    table(): Table|undefined {
+        let b = this.braces(this.field_list);
+        if (!b) return undefined;
+        return new Table(this, b.fields);
+    }
+
+    field(): Field|undefined {
+        return this.either(
+            this.named_field,
+            this.expr
+        );
+    }
+
+    named_field(): Named_Field|undefined {
+        let seq = this.sequence(
+            () => this.either(
+                this.ident,
+                () => this.brackets(this.expr)
+            ),
+            () => this.exact_symbol("="),
+            this.expr
+        );
+        if (!seq) return undefined;
+        return new Named_Field(this, ...seq);
+    }
+
+    field_sep(): Field_Sep|undefined {
+        return this.either(
+            () => this.exact_symbol(","),
+            () => this.exact_symbol(";")
+        );
+    }
+
+    field_list(): Field_List|undefined {
+        let fields = this.alternating(this.field, this.field_sep)
+        if (!fields) return undefined;
+        return new Field_List(this, fields);
     }
 
     args(): Args|undefined {
@@ -1044,20 +845,32 @@ class Parser {
         )
     }
 
+    method_name(): Method_Name|undefined {
+        let seq = this.sequence(
+            () => this.exact_symbol(":"),
+            this.ident
+        );
+        if (!seq) return undefined;
+        return new Method_Name(this, {
+            colon: seq[0],
+            name: seq[1]
+        });
+    }
+
+    method_call(): Method_Call|undefined {
+        let seq = this.sequence(
+            this.method_name,
+            this.args
+        );
+        if (!seq) return undefined;
+        return new Method_Call(this, ...seq)
+    }
+
     call(): Call|undefined {
-        this.skip_ws();
         return this.either(
             this.args,
             this.method_call
         )
-    }
-
-    suffix(): Suffix|undefined {
-        this.skip_ws();
-        return this.either(
-            this.call,
-            this.index
-        );
     }
 
     value(): Value|undefined {
@@ -1067,26 +880,26 @@ class Parser {
             () => this.exact_keyword("true"),
             this.num, this.str,
             () => this.exact_symbol("..."),
-            () => this.parens(this.expr)
+            () => this.parens(this.expr),
             // TODO: Function
-            // TODO: TableConstructor
+            this.table,
             // TODO: FunctionCall
-            // TODO: var
-            // TODO: ( expr )
+            this.variable,
+            () => this.parens(this.expr),
         );
     }
 
-    keyword(): InstanceType<AST_KEYWORDS[keyof AST_KEYWORDS]> | undefined {
+    keyword(): InstanceType<AST.KEYWORDS[keyof AST.KEYWORDS]> | undefined {
         this.skip_ws();
         if (this.at_end()) return undefined;
 
         let ident = this.ident();
         if (!ident) { return undefined; }
-        if (!(ident.text in AST_Keywords)) {
+        if (!(ident.text in AST.Keywords)) {
             this.rollback(ident);
             return undefined;
         }
-        let kwd = new AST_Keywords[ident.text as keyof typeof AST_Keywords](this);
+        let kwd = new AST.Keywords[ident.text as keyof typeof AST.Keywords](this);
         kwd.withPos(ident);
         return kwd;
     }
@@ -1117,7 +930,7 @@ class Parser {
         );
     }
 
-    list<K extends AST_Node>(fn: () => K|undefined): K[] {
+    list<K extends AST.Node>(fn: () => K|undefined): K[] {
         let arr = [];
         let tok = fn.call(this);
         while (tok) {
@@ -1125,13 +938,6 @@ class Parser {
             tok = fn();
         }
         return arr;
-    }
-
-    exact<K extends AST_Node>(fn: ()=>K|undefined, text: string): K|undefined {
-        let tok = fn.call(this);
-        if (!tok) return undefined;
-        if (tok.text !== text) { this.rollback(tok); return undefined; }
-        return tok;
     }
 
     dot_access(): Dot_Access|undefined {
@@ -1155,12 +961,16 @@ class Parser {
         )
     }
 
-    index_access(): Index_Access {
+    index_access(): Index_Access|undefined {
         this.skip_ws();
         let prefix = this.prefix();
         if (!prefix) return undefined;
         let suffixes = this.list(this.suffix);
         let index = this.index();
+        if (!index) {
+            this.rollback(prefix);
+            return undefined;
+        }
 
         return new Index_Access(this, prefix, suffixes, index);
     }
@@ -1172,6 +982,42 @@ class Parser {
         );
         if (!val) return undefined;
         return new Var(this, val);
+    }
+
+    var_list(): Var_List|undefined {
+        let args = this.no_trailing(this.variable, ()=>this.exact_symbol(","));
+        if (!args) return undefined;
+        return new Var_List(this, args)
+    }
+
+    assign(): Assign|undefined {
+        let seq = this.sequence(
+            this.var_list,
+            () => this.exact_symbol("="),
+            this.expr_list
+        );
+        if (!seq) return undefined;
+        return new Assign(this, {
+            vars: seq[0],
+            equals: seq[1],
+            exprs: seq[2]
+        });
+    }
+
+    statement(): Statement|undefined {
+        return this.either(
+            this.assign,
+             // @TODO: functioncall |
+             // @TODO: doblock |
+             // @TODO: while |
+             // @TODO: repeat |
+             // @TODO: if |
+             // @TODO: `for` ident `=´ exp `,´ exp [`,´ exp] doblock |
+             // @TODO: `for` namelist `in` explist doblock |
+             // @TODO: `function` funcname funcbody |
+             // @TODO: `local` `function` ident funcbody |
+             // @TODO: `local` namelist [`=´ explist]
+        );
     }
 
     parse() {
