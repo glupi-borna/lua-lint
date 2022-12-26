@@ -126,16 +126,45 @@ export namespace AST {
         }
     }
 
+    export function start_and_end(...nodes: Node[]): [Position, Position] {
+        let min_pos = nodes[0].start;
+        let max_pos = nodes[0].end;
+        for (let node of nodes) {
+            if (!node) continue;
+            if (node.start.index < min_pos.index) min_pos = node.start;
+            if (node.end.index > max_pos.index) max_pos = node.end;
+        }
+        return [min_pos.copy(), max_pos.copy()];
+    }
+
+    function nl_indent(depth=0) {
+        return "\n" + "\t".repeat(depth);
+    }
+
     export class Node {
         static type: NODE = NODE.UNKNOWN;
+        static allow_empty = false;
         start: Position;
         end: Position;
 
-        constructor(public parser: Parser) {
+        constructor(public parser: Parser, start?: Position, end?: Position) {
             this.parser = parser;
-            assert(parser.start !== parser.current, "Parser start and current are the same object.");
-            this.start = parser.start.copy();
-            this.end = parser.current.copy();
+
+            start = start ?? parser.start;
+            end = end ?? parser.current;
+
+            assert(start !== end, "Start and current are the same object.");
+            if (!this.allow_empty) {
+                assert(
+                    start.index !== end.index,
+                    "Start and current are at the same index.");
+            }
+            this.start = start.copy();
+            this.end = end.copy();
+        }
+
+        get allow_empty() {
+            return (this.constructor as typeof Node).allow_empty;
         }
 
         get type() {
@@ -150,14 +179,8 @@ export namespace AST {
             return this.parser.text.substring(this.start.index, this.end.index);
         }
 
-        withPos(...tokens: (Node|undefined)[]) {
-            let min_pos = this.start;
-            let max_pos = this.end;
-            for (let token of tokens) {
-                if (!token) continue;
-                if (token.start.index < min_pos.index) min_pos = token.start;
-                if (token.end.index > max_pos.index) max_pos = token.end;
-            }
+        withPos(...tokens: Node[]) {
+            let [min_pos, max_pos] = start_and_end(...tokens);
             this.start.set(min_pos);
             this.end.set(max_pos);
             return this;
@@ -173,16 +196,24 @@ export namespace AST {
         }
 
         toString() {
-            let n = this.constructor.name;
-            let props = this.keys().map((p) => `${p}: ${(this as any)[p]}`).join(", ");
-            return `${n}(${props})`;
+            return JSON.stringify(this);
+        }
+
+        toJSON() {
+            let props: any = {};
+            for (let key of this.keys()) {
+                props[key] = (this as any)[key];
+            }
+            return [
+                this.constructor.name,
+                props
+            ];
         }
     }
 
     export abstract class Wrapper<T extends Node> extends Node {
         constructor(parser: Parser, public value: T) {
-            super(parser);
-            this.withPos(value);
+            super(parser, value.start, value.end);
         }
     }
 
@@ -191,8 +222,7 @@ export namespace AST {
             parser: Parser,
             public fields: T
         ) {
-            super(parser);
-            this.withPos(...Object.values(fields));
+            super(parser, ...start_and_end(...Object.values(fields)));
         }
     }
 
@@ -219,8 +249,13 @@ export namespace AST {
             parser: Parser,
             public list: T[]
         ) {
-            super(parser);
-            this.withPos(...list);
+            let start = parser.start;
+            let end = parser.current
+
+            if (list.length > 0) {
+                [start, end] = start_and_end(...list)
+            }
+            super(parser, start, end);
         }
     }
 
@@ -233,7 +268,6 @@ export namespace AST {
             args: No_Trailing_Array<T, DELIMITER>
         ) {
             super(parser, args);
-            this.withPos(...args);
         }
     }
 
@@ -263,7 +297,7 @@ export namespace AST {
             get type(): AST {
                 return _.type;
             }
-            constructor(parser: Parser) { super(parser); }
+            constructor(parser: Parser, node?: Node) { super(parser, node?.start, node?.end); }
         };
     }
 

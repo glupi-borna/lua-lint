@@ -1118,7 +1118,3 @@ function init()
 
     config.MakeCommand("frotate", frotate.run, config.NoComplete)
 end
-
-[[String at end of file!]]
-[===[String at end of file!]===]
-[====[String at end of file!]===]]====]

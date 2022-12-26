@@ -3,6 +3,14 @@ import { readFileSync } from 'fs';
 import { LETTERS, DIGITS, IDENT_CHARS, SIMPLE_SYMBOLS } from './char';
 import { AST, Literal, Alternating_Array, No_Trailing_Array } from './ast_util';
 
+let TRACE_EXECUTION = false;
+
+
+if (process.argv.some(a => a === "--trace")) {
+    TRACE_EXECUTION = true;
+}
+
+
 class Identifier extends AST.Node {
     static type = AST.NODE.IDENTIFIER;
     value = this.text;
@@ -66,6 +74,7 @@ function is_value(o: any): o is Value {
 
 class Suffixes extends AST.List<Suffix> {
     static type = AST.NODE.SUFFIXES;
+    static allow_empty = true;
 }
 
 class Func_Call extends AST.Sequence<{
@@ -100,11 +109,10 @@ class Index_Access extends AST.Node {
     constructor(
         parser: Parser,
         public prefix: Prefix,
-        public suffixes: Suffix[],
+        public suffixes: Suffixes,
         public index: Index
     ) {
-        super(parser);
-        this.withPos(this.prefix, this.index, ...this.suffixes);
+        super(parser, prefix.start, index.end);
     }
 }
 
@@ -135,6 +143,7 @@ class Var_List extends AST.Delimited<Var, AST.SYMBOL<",">> {
 
 class Expr_List extends AST.Delimited<Expr, AST.SYMBOL<",">> {
     static type = AST.NODE.EXPR_LIST;
+    static allow_empty = true;
 }
 
 class Var_Args extends AST.Prefixed<AST.SYMBOL<",">, AST.SYMBOL<"...">> {
@@ -170,8 +179,7 @@ class Binary_Operation extends AST.Node {
         public op: Binary_Operator,
         public right: Expr
     ) {
-        super(parser);
-        this.withPos(this.left, this.right);
+        super(parser, left.start, right.end);
     }
 }
 
@@ -183,8 +191,7 @@ class Unary_Operation extends AST.Node {
         public op: Unary_Operator,
         public exp: Expr
     ) {
-        super(parser);
-        this.withPos(this.op, this.exp);
+        super(parser, op.start, exp.end);
     }
 }
 
@@ -214,6 +221,10 @@ class Method_Call extends AST.Node {
 
 /** args | ':' IDENTIFIER args */
 type Call = Args | Method_Call;
+function is_call(o: any): o is Call {
+    return AST.is_any(o, Table, Str, Method_Call) ||
+        (AST.is(o, Parens) && AST.is(o.fields.value, Expr_List));
+}
 
 /** `(´ [explist] `)´ | tableconstructor | String */
 type Args = Parens<Expr_List>|Table|Str;
@@ -246,7 +257,7 @@ class Field_List extends AST.Delimited_Trailing<Field, Field_Sep> {
     static type = AST.NODE.FIELD_LIST;
 }
 
-class Return_Statement extends AST.Prefixed<AST.KEYWORD<"return">, Expr> {
+class Return_Statement extends AST.Prefixed<AST.KEYWORD<"return">, Expr_List> {
     static type = AST.NODE.RETURN;
 }
 
@@ -401,6 +412,21 @@ type RequiredTypes<T> = {
     [K in keyof T]: NonNullable<T[K]>
 }
 
+function memoized<A, B>(fn: (a:A)=>B) {
+    const cache = new Map<A, B>();
+
+    return (a: A) => {
+        if (cache.has(a)) return cache.get(a) as B;
+        let b = fn(a);
+        cache.set(a, b);
+        return b;
+    };
+}
+
+function replaceAt(str: string, index: number, replacement: string) {
+    return str.substring(0, index) + replacement + str.substring(index + replacement.length);
+}
+
 class Parser {
     text: string;
     start = new AST.Position(0, 0);
@@ -412,8 +438,23 @@ class Parser {
 
     char(add=0) { return this.text[this.current.index+add]; }
     move(amt=1) { this.current.move(amt); }
-    rollback(token?: AST.Node) { this.current.set((token||this).start); }
+    rollback(token?: AST.Node) {
+        let pos = (token||this).start;
+        this.current.set((token||this).start);
+    }
     at_end() { return this.current.index >= this.text.length; }
+
+    current_text() {
+        return this.text.substring(this.start.index, this.current.index);
+    }
+
+    context() {
+        let lines = this.text.split("\n");
+        let firstchar = lines.slice(0, this.start.line).join("\n").length+1;
+        let realchar = this.start.index;
+        let offset = realchar - firstchar;
+        return replaceAt(lines[this.start.line], offset, "^");
+    }
 
     ast_node<
         T extends AST.Node,
@@ -425,6 +466,29 @@ class Parser {
         let t = new cls(this, ...args);
         this.start = this.current.copy();
         return t as any;
+    }
+
+    trace(msg: string) {
+        let stack = (new Error()).stack;
+        if (!stack) return;
+        console.log(
+            msg + ":\n" +
+            "context: \n" + this.context() + "\n" +
+            stack
+                .split("\n")
+                .filter(s => s.includes("at Parser"))
+                .filter(s =>
+                    !s.includes("either") &&
+                    !s.includes("sequence") &&
+                    !s.includes("no_trailing") &&
+                    !s.includes("alternating")
+                )
+                .slice(1)
+                .reverse()
+                .map((s, i) => "| ".repeat(i) + s.trim().replaceAll("Parser.", "").split(" ")[1])
+                .join("\n")
+            + "\n"
+        );
     }
 
     skip_ws() {
@@ -487,7 +551,7 @@ class Parser {
         this.skip_ws();
         if (this.at_end()) return undefined;
 
-        let node: AST.Node|undefined = undefined;
+        let found = false;
         switch (this.char()) {
             case "=":
             case "~":
@@ -495,31 +559,32 @@ class Parser {
             case ">":
                 if (this.char(1) == "=") {
                     this.move(2);
-                    node = this.ast_node(AST.Node);
+                    found = true;
                 } else if (this.char() != "~") {
                     this.move(1);
-                    node = this.ast_node(AST.Node);
+                    found = true;
                 }
                 break;
             case ".":
                 if (this.char(1) == ".") {
                     if (this.char(2) == ".") {
                         this.move(3);
-                        node = this.ast_node(AST.Node);
+                        found = true;
+                        break;
                     }
                     this.move(2);
-                    node = this.ast_node(AST.Node);
+                    found = true;
+                    break;
                 }
-                node = this.ast_node(AST.Node);
         }
 
-        if (node === undefined && SIMPLE_SYMBOLS.includes(this.char())) {
-            node = this.ast_node(AST.Node);
+        if (!found && SIMPLE_SYMBOLS.includes(this.char())) {
             this.move();
+            found = true;
         };
 
-        if (!node) return undefined;
-        return new AST.Symbols[node.text as keyof AST.SYMBOLS](this);
+        if (!found) return undefined;
+        return new AST.Symbols[this.current_text() as keyof AST.SYMBOLS](this);
     }
 
     long_bracket<T extends AST.Node>(token_type: new (parser: Parser) => T) {
@@ -588,7 +653,11 @@ class Parser {
         let out = [];
         for (let fn of fns) {
             let res = fn.call(this);
-            if (!res) { this.rollback(out[0]); return undefined }
+            if (!res) {
+                // this.trace("Sequence failed while trying to parse " + fn.name);
+                if (out.length > 0) this.rollback(out[0]);
+                return undefined;
+            }
             out.push(res);
         }
         return out as any;
@@ -598,9 +667,9 @@ class Parser {
         FN extends (() => (AST.Node | undefined))
     >(fn: FN): Parens<Exclude<ReturnType<FN>, undefined>> | undefined {
         let seq = this.sequence(
-            () => this.exact_symbol("("),
+            this.symbol_matcher("("),
             fn,
-            () => this.exact_symbol(")")
+            this.symbol_matcher(")")
         );
         if (!seq) { return undefined; }
         return new Parens(this, {
@@ -614,9 +683,9 @@ class Parser {
         FN extends (() => (AST.Node | undefined))
     >(fn: FN): Braces<Exclude<ReturnType<FN>, undefined>> | undefined {
         let seq = this.sequence(
-            () => this.exact_symbol("{"),
+            this.symbol_matcher("{"),
             fn,
-            () => this.exact_symbol("}")
+            this.symbol_matcher("}")
         );
         if (!seq) { return undefined; }
         return new Braces(this, {
@@ -630,9 +699,9 @@ class Parser {
         FN extends (() => (AST.Node | undefined))
     >(fn: FN): Brackets<Exclude<ReturnType<FN>, undefined>> | undefined {
         let seq = this.sequence(
-            () => this.exact_symbol("["),
+            this.symbol_matcher("["),
             fn,
-            () => this.exact_symbol("]")
+            this.symbol_matcher("]")
         );
         if (!seq) { return undefined; }
         return new Brackets(this, {
@@ -643,9 +712,13 @@ class Parser {
     }
 
     exact<K extends AST.Node>(fn: ()=>K|undefined, text: string): K|undefined {
+        this.skip_ws();
         let tok = fn.call(this);
         if (!tok) return undefined;
-        if (tok.text !== text) { this.rollback(tok); return undefined; }
+        if (tok.text !== text) {
+            this.rollback(tok);
+            return undefined;
+        }
         return tok;
     }
 
@@ -656,6 +729,25 @@ class Parser {
     exact_keyword<K extends keyof AST.KEYWORDS>(str: Literal<K, string>): AST.KEYWORD<K>|undefined {
         return this.exact(this.keyword, str) as AST.KEYWORD<K>|undefined;
     }
+
+    symbol_matcher = memoized(<K extends keyof AST.SYMBOLS>(sym: Literal<K, string>) => {
+        let fn = () => this.exact_symbol(sym);
+        Object.defineProperty(fn, 'name', {
+            value: "symbol_" + sym,
+            configurable: true
+        });
+        return fn;
+    });
+
+    keyword_matcher = memoized(<K extends keyof AST.KEYWORDS>(kw: Literal<K, string>) => {
+        let fn = () => this.exact_keyword(kw);
+        Object.defineProperty(fn, 'name', {
+            value: "keyword_" + kw,
+            configurable: true
+        });
+        return fn;
+    });
+
 
     either<
         FN extends (() => (AST.Node | undefined))[]
@@ -668,6 +760,7 @@ class Parser {
             let tok = fn.call(this);
             if (tok) return tok as any;
         }
+        // this.trace("Failed to parse any of " + fns.map(f => f.name).join(", "))
         return undefined;
     }
 
@@ -679,14 +772,14 @@ class Parser {
         fn_b: FNB
     ) {
         this.skip_ws();
-        let first = fn_a();
+        let first = fn_a.call(this);
         if (!first) { return undefined; }
         let args = [first];
         while (true) {
-            let b = fn_b();
+            let b = fn_b.call(this);
             if (!b) break;
             args.push(b);
-            let a = fn_a();
+            let a = fn_a.call(this);
             if (!a) break;
             args.push(a);
         }
@@ -702,16 +795,25 @@ class Parser {
         FNB extends (() => (AST.Node | undefined))
     >(
         fn_a: FNA,
-        fn_b: FNB
+        fn_b: FNB,
+        allow_empty: boolean
     ) {
         this.skip_ws();
-        let first = fn_a();
-        if (!first) { return undefined; }
+        let first = fn_a.call(this);
+        if (!first) {
+            if (allow_empty) {
+                return [] as unknown as No_Trailing_Array<
+                    NonNullable<ReturnType<FNA>>,
+                    NonNullable<ReturnType<FNB>>
+                >;
+            }
+            return undefined;
+        }
         let args = [first];
         while (true) {
-            let b = fn_b();
+            let b = fn_b.call(this);
             if (!b) break;
-            let a = fn_a();
+            let a = fn_a.call(this);
             if (!a) {
                 this.rollback(first);
                 return undefined
@@ -743,38 +845,34 @@ class Parser {
 
     unop(): Unary_Operator|undefined {
         let op = this.either(
-            () => this.exact_symbol("-"),
-            () => this.exact_keyword("not"),
-            () => this.exact_symbol("#"),
+            this.symbol_matcher("-"),
+            this.keyword_matcher("not"),
+            this.symbol_matcher("#"),
         );
         if (!op) return undefined;
-        let u = new Unary_Operator(this);
-        u.withPos(op);
-        return u;
+        return new Unary_Operator(this, op.start, op.end);
     }
 
     binop(): Binary_Operator|undefined {
         let op = this.either(
-            () => this.exact_symbol("+"),
-            () => this.exact_symbol("-"),
-            () => this.exact_symbol("*"),
-            () => this.exact_symbol("/"),
-            () => this.exact_symbol("^"),
-            () => this.exact_symbol("%"),
-            () => this.exact_symbol(".."),
-            () => this.exact_symbol("<"),
-            () => this.exact_symbol(">"),
-            () => this.exact_symbol("<="),
-            () => this.exact_symbol(">="),
-            () => this.exact_symbol("=="),
-            () => this.exact_symbol("~="),
-            () => this.exact_keyword("and"),
-            () => this.exact_keyword("or"),
+            this.symbol_matcher("+"),
+            this.symbol_matcher("-"),
+            this.symbol_matcher("*"),
+            this.symbol_matcher("/"),
+            this.symbol_matcher("^"),
+            this.symbol_matcher("%"),
+            this.symbol_matcher(".."),
+            this.symbol_matcher("<"),
+            this.symbol_matcher(">"),
+            this.symbol_matcher("<="),
+            this.symbol_matcher(">="),
+            this.symbol_matcher("=="),
+            this.symbol_matcher("~="),
+            this.keyword_matcher("and"),
+            this.keyword_matcher("or"),
         );
         if (!op) return undefined;
-        let u = new Binary_Operator(this);
-        u.withPos(op);
-        return u;
+        return new Binary_Operator(this, op.start, op.end);
     }
 
     prefix(): Prefix|undefined {
@@ -791,8 +889,13 @@ class Parser {
         );
     }
 
-    expr_list(): Expr_List|undefined {
-        let exprs = this.no_trailing(this.expr, () => this.exact_symbol(","));
+    suffixes(): Suffixes {
+        let suffixes = this.list(this.suffix);
+        return new Suffixes(this, suffixes);
+    }
+
+    expr_list(allow_empty: boolean): Expr_List|undefined {
+        let exprs = this.no_trailing(this.expr, this.symbol_matcher(","), allow_empty);
         if (!exprs) return undefined;
         return new Expr_List(this, exprs);
     }
@@ -816,7 +919,7 @@ class Parser {
                 this.ident,
                 () => this.brackets(this.expr)
             ),
-            () => this.exact_symbol("="),
+            this.symbol_matcher("="),
             this.expr
         );
         if (!seq) return undefined;
@@ -825,8 +928,8 @@ class Parser {
 
     field_sep(): Field_Sep|undefined {
         return this.either(
-            () => this.exact_symbol(","),
-            () => this.exact_symbol(";")
+            this.symbol_matcher(","),
+            this.symbol_matcher(";")
         );
     }
 
@@ -837,17 +940,16 @@ class Parser {
     }
 
     args(): Args|undefined {
-        this.skip_ws();
         return this.either(
             this.str,
             this.table,
-            () => this.parens(this.expr_list)
-        )
+            () => this.parens(() => this.expr_list(true))
+        );
     }
 
     method_name(): Method_Name|undefined {
         let seq = this.sequence(
-            () => this.exact_symbol(":"),
+            this.symbol_matcher(":"),
             this.ident
         );
         if (!seq) return undefined;
@@ -873,17 +975,28 @@ class Parser {
         )
     }
 
+    func(): Func|undefined {
+        let seq = this.sequence(
+            this.keyword_matcher("function"),
+            this.func_body
+        );
+        if (!seq) return undefined;
+        return new Func(this, {
+            keyword: seq[0],
+            body: seq[1]
+        });
+    }
+
     value(): Value|undefined {
         return this.either(
-            () => this.exact_keyword("nil"),
-            () => this.exact_keyword("false"),
-            () => this.exact_keyword("true"),
+            this.keyword_matcher("nil"),
+            this.keyword_matcher("false"),
+            this.keyword_matcher("true"),
             this.num, this.str,
-            () => this.exact_symbol("..."),
-            () => this.parens(this.expr),
-            // TODO: Function
+            this.symbol_matcher("..."),
+            this.func,
             this.table,
-            // TODO: FunctionCall
+            this.function_call,
             this.variable,
             () => this.parens(this.expr),
         );
@@ -899,7 +1012,7 @@ class Parser {
             this.rollback(ident);
             return undefined;
         }
-        let kwd = new AST.Keywords[ident.text as keyof typeof AST.Keywords](this);
+        let kwd = new AST.Keywords[ident.text as keyof typeof AST.Keywords](this, ident);
         kwd.withPos(ident);
         return kwd;
     }
@@ -935,7 +1048,7 @@ class Parser {
         let tok = fn.call(this);
         while (tok) {
             arr.push(tok);
-            tok = fn();
+            tok = fn.call(this);
         }
         return arr;
     }
@@ -943,7 +1056,7 @@ class Parser {
     dot_access(): Dot_Access|undefined {
         this.skip_ws();
         let seq = this.sequence(
-            () => this.exact_symbol("."),
+            this.symbol_matcher("."),
             this.ident
         );
         if (!seq) return undefined;
@@ -954,7 +1067,6 @@ class Parser {
     }
 
     index(): Index|undefined {
-        this.skip_ws();
         return this.either(
             () => this.brackets(this.expr),
             this.dot_access
@@ -963,38 +1075,61 @@ class Parser {
 
     index_access(): Index_Access|undefined {
         this.skip_ws();
-        let prefix = this.prefix();
-        if (!prefix) return undefined;
-        let suffixes = this.list(this.suffix);
-        let index = this.index();
-        if (!index) {
-            this.rollback(prefix);
+        let seq = this.sequence(
+            this.prefix,
+            this.suffixes
+        );
+        if (!seq) return undefined;
+
+        let suffixes = seq[1];
+
+        let list = [...suffixes.list];
+        let last_suffix = list.at(-1);
+        let last_rejected: AST.Node|undefined = undefined;
+
+        while (last_suffix && is_call(last_suffix)) {
+            last_rejected = list.pop();
+            last_suffix = list.at(-1);
+        }
+
+        if (!last_suffix) {
+            this.rollback(seq[0]);
             return undefined;
         }
 
-        return new Index_Access(this, prefix, suffixes, index);
+        let index = list.pop() as Index;
+
+        this.rollback(last_rejected);
+        suffixes.list = list;
+        if (list.length > 0) {
+            suffixes.withPos(...list);
+        } else {
+            suffixes.end.set(suffixes.start);
+        }
+
+        return new Index_Access(this, ...seq, index);
     }
 
     variable(): Var|undefined {
-        this.skip_ws();
         let val = this.either(
+            this.index_access,
             this.ident
         );
         if (!val) return undefined;
         return new Var(this, val);
     }
 
-    var_list(): Var_List|undefined {
-        let args = this.no_trailing(this.variable, ()=>this.exact_symbol(","));
+    var_list(allow_empty: boolean): Var_List|undefined {
+        let args = this.no_trailing(this.variable, this.symbol_matcher(","), allow_empty);
         if (!args) return undefined;
         return new Var_List(this, args)
     }
 
     assign(): Assign|undefined {
         let seq = this.sequence(
-            this.var_list,
-            () => this.exact_symbol("="),
-            this.expr_list
+            () => this.var_list(false),
+            this.symbol_matcher("="),
+            () => this.expr_list(false)
         );
         if (!seq) return undefined;
         return new Assign(this, {
@@ -1004,30 +1139,394 @@ class Parser {
         });
     }
 
+    function_call(): Func_Call|undefined {
+        this.skip_ws();
+        let seq = this.sequence(
+            this.prefix,
+            this.suffixes
+        );
+        if (!seq) return undefined;
+        let suffixes = seq[1];
+
+        let list = [...suffixes.list];
+        let last_suffix = list.at(-1);
+        let last_rejected: AST.Node|undefined = undefined;
+
+        while (last_suffix && !is_call(last_suffix)) {
+            last_rejected = list.pop();
+            last_suffix = list.at(-1);
+        }
+
+        if (!last_suffix) {
+            this.rollback(seq[0]);
+            return undefined;
+        }
+
+        let call = list.pop() as Call;
+
+        this.rollback(last_rejected);
+        suffixes.list = list;
+        if (list.length > 0) {
+            suffixes.withPos(...list);
+        } else {
+            suffixes.end.set(suffixes.start);
+        }
+
+        return new Func_Call(this, {
+            prefix: seq[0],
+            suffixes: suffixes,
+            call: call
+        });
+    }
+
+    block(): Block {
+        this.skip_ws();
+        let slist = this.statement_list();
+        let last = this.last_statement();
+
+        return new Block(this, {
+            statements: slist,
+            last_statement: last
+        });
+    }
+
+    do_block(): Do_Block|undefined {
+        this.skip_ws();
+        let seq = this.sequence(
+            this.keyword_matcher("do"),
+            this.block,
+            this.keyword_matcher("end")
+        );
+        if (!seq) return undefined;
+        return new Do_Block(this, {
+            do: seq[0],
+            block: seq[1],
+            end: seq[2]
+        });
+    }
+
+    while_loop(): While|undefined {
+        let seq = this.sequence(
+            this.keyword_matcher("while"),
+            this.expr,
+            this.keyword_matcher("do"),
+            this.block,
+            this.keyword_matcher("end")
+        );
+        if (!seq) { return undefined; }
+        return new While(this, {
+            while_keyword: seq[0],
+            condition: seq[1],
+            do_keyword: seq[2],
+            block: seq[3],
+            end_keyword: seq[4]
+        });
+    }
+
+    namelist(allow_empty: boolean): Identifier_List | undefined {
+        let l = this.no_trailing(this.ident, this.symbol_matcher(","), allow_empty);
+        if (!l) return undefined;
+        return new Identifier_List(this, l);
+    }
+
+    assign_exprs(): Assign_Exprs|undefined {
+        let seq = this.sequence(
+            this.symbol_matcher("="),
+            () => this.expr_list(false)
+        );
+        if (!seq) return undefined;
+        return new Assign_Exprs(this, {
+            assign: seq[0],
+            exprs: seq[1]
+        });
+    }
+
+    local_var_decl(): Local_Var_Decl|undefined {
+        let seq = this.sequence(
+            this.keyword_matcher("local"),
+            () => this.namelist(false)
+        );
+        if (!seq) return undefined;
+        return new Local_Var_Decl(this, {
+            local_keyword: seq[0],
+            names: seq[1],
+            exprs: this.assign_exprs()
+        });
+    }
+
+    func_name_no_method(): Func_Name_No_Method|undefined {
+        let args = this.no_trailing(this.ident, this.symbol_matcher("."), false);
+        if (!args) return undefined;
+        return new Func_Name_No_Method(this, args);
+    }
+
+    func_name(): Func_Name|undefined {
+        let fn = this.func_name_no_method();
+        if (!fn) return undefined;
+        return new Func_Name(this, {
+            name: fn,
+            method: this.method_name()
+        });
+    }
+
+    varargs(): Var_Args|undefined {
+        let seq = this.sequence(
+            this.symbol_matcher(","),
+            this.symbol_matcher("...")
+        );
+        if (!seq) return undefined;
+        return new Var_Args(this, {
+            prefix: seq[0],
+            value: seq[1]
+        });
+    }
+
+    param_list(): Param_List|undefined {
+        let params = this.namelist(false);
+        if (!params) return undefined;
+
+        return new Param_List(this, {
+            params: params,
+            varargs: this.varargs()
+        });
+    }
+
+    params(): Params|undefined {
+        return this.either(
+            this.param_list,
+            this.symbol_matcher("...")
+        );
+    }
+
+    func_body(): Func_Body|undefined {
+        let seq = this.sequence(
+            () => this.parens(this.params),
+            this.block,
+            this.keyword_matcher("end")
+        );
+        if (!seq) return undefined;
+        return new Func_Body(this, {
+            params: seq[0],
+            body: seq[1],
+            end: seq[2]
+        });
+    }
+
+    func_decl(): Func_Decl|undefined {
+        let seq = this.sequence(
+            this.keyword_matcher("function"),
+            this.func_name,
+            this.func_body
+        );
+        if (!seq) return undefined;
+        return new Func_Decl(this, {
+            func_keyword: seq[0],
+            name: seq[1],
+            body: seq[2]
+        });
+    }
+
+    elseif(): ElseIf|undefined {
+        let seq = this.sequence(
+            this.keyword_matcher("elseif"),
+            this.expr,
+            this.keyword_matcher("then"),
+            this.block
+        );
+        if (!seq) return undefined;
+        return new ElseIf(this, {
+            elseif_keyword: seq[0],
+            condition: seq[1],
+            then_keyword: seq[2],
+            block: seq[3]
+        });
+    }
+
+    elseifs(): ElseIf_List|undefined {
+        let else_ifs = this.list(this.elseif);
+        if (else_ifs.length == 0) return undefined;
+        return new ElseIf_List(this, else_ifs);
+    }
+
+    else_statement(): Else|undefined {
+        let seq = this.sequence(
+            this.keyword_matcher("else"),
+            this.block
+        );
+        if (!seq) return undefined;
+        return new Else(this, {
+            else_keyword: seq[0],
+            block: seq[1]
+        });
+    }
+
+    if_statement(): If|undefined {
+        let seq = this.sequence(
+            this.keyword_matcher("if"),
+            this.expr,
+            this.keyword_matcher("then"),
+            this.block
+        );
+        if (!seq) return undefined;
+
+        let elseifs = this.elseifs();
+        let else_stat = this.else_statement();
+
+        let end = this.exact_keyword("end");
+        if (!end) {
+            this.rollback(seq[0]);
+            return undefined;
+        }
+
+        return new If(this, {
+            if_keyword: seq[0],
+            condition: seq[1],
+            then_keyword: seq[2],
+            block: seq[3],
+            elseifs: elseifs,
+            Else: else_stat,
+            end_keyword: end
+        });
+    }
+
     statement(): Statement|undefined {
         return this.either(
             this.assign,
-             // @TODO: functioncall |
-             // @TODO: doblock |
-             // @TODO: while |
+            this.function_call,
+            this.do_block,
+            this.while_loop,
              // @TODO: repeat |
-             // @TODO: if |
+             this.if_statement,
              // @TODO: `for` ident `=´ exp `,´ exp [`,´ exp] doblock |
              // @TODO: `for` namelist `in` explist doblock |
-             // @TODO: `function` funcname funcbody |
+             this.func_decl,
              // @TODO: `local` `function` ident funcbody |
-             // @TODO: `local` namelist [`=´ explist]
+             this.local_var_decl,
         );
+    }
+
+    statement_list(): Statement_List {
+        return new Statement_List(this, this.list(this.statement));
+    }
+
+    return_statement(): Return_Statement | undefined {
+        let seq = this.sequence(
+            this.keyword_matcher("return"),
+            () => this.expr_list(true)
+        );
+        if (!seq) return undefined;
+        return new Return_Statement(this, {
+            prefix: seq[0],
+            value: seq[1]
+        });
+    }
+
+    last_statement(): Last_Statement | undefined {
+        let stat = this.either(
+            this.return_statement,
+            this.keyword_matcher("break")
+        );
+        if (!stat) return undefined;
+        let semi = this.exact_symbol(";");
+        return new Last_Statement(this, {
+            statement: stat,
+            semicolon: semi
+        });
     }
 
     parse() {
         let tokens = [];
         while (!this.at_end()) {
-            let tok = this.either(this.num, this.variable, this.ident, this.str, this.symbol, this.other);
-            if (tok) { tokens.push(tok); continue; }
+            let tok = this.statement();
+            if (tok) {
+                tokens.push(tok);
+                continue;
+            }
             break;
         }
         return tokens;
+    }
+}
+
+const SKIP_FNS = [
+    "proto", "char", "move",
+    "at_end", "skip_ws", "either",
+    "sequence", "context", "exact",
+    "keyword", "symbol", "list",
+    "rollback", "<anonymous>",
+    "keyword_", "symbol_", "current_text",
+    "ast_node", "exact_symbol", "ident",
+    "long_bracket"
+];
+
+function includes_skip(str: string): boolean {
+    for (let fn of SKIP_FNS) {
+        if (str.includes("Parser." + fn + ".")) return true;
+        if (str.includes("Parser." + fn + " ")) return true;
+        if (str.includes("Parser.keyword_")) return true;
+        if (str.includes("Parser.symbol_")) return true;
+    }
+    return false;
+}
+
+function get_depth() {
+    let stack = (new Error()).stack;
+    if (!stack) return 0;
+    let f = stack.split("\n")
+        .filter(s =>
+            s !== "Error" &&
+            !includes_skip(s) &&
+            !s.includes("get_depth") &&
+            !s.includes("Object.") &&
+            !s.includes("Module.") &&
+            !s.includes("Function.") &&
+            !s.includes("node:internal/") &&
+            true
+        );
+    // console.log(f);
+    return f.length;
+}
+
+if (TRACE_EXECUTION) {
+    Error.stackTraceLimit = Infinity;
+    let proto = Parser.prototype as any;
+    let keys = Object.getOwnPropertyNames(proto);
+    let moved = false;
+    for (let fn_name of keys) {
+        let fn = proto[fn_name] as (...args: any[]) => any;
+        if (fn_name === "move" || fn_name === "rollback") {
+            proto[fn_name] = function(...args: any[]) {
+                moved = true;
+                return fn.call(this, ...args);
+            }
+        }
+        if (fn_name === "Parser") continue;
+        if (SKIP_FNS.includes(fn_name)) continue;
+        proto[fn_name] = function(...args: any[]) {
+            let first_string_arg = args.length === 1 ? args[0] : "";
+            if (typeof first_string_arg !== "string") first_string_arg = "";
+            let depth = get_depth();
+            let indent = "┊ ".repeat(depth);
+            let ctx = "";
+            if (depth > 3 && moved) {
+                ctx = this.context();
+                moved = false;
+            }
+            let str = (indent + fn_name + " " + first_string_arg).padEnd(60) + ctx;
+            console.log(str);
+            let res = fn.call(this, ...args);
+            let ret = res instanceof AST.Node ? `${res.kind}` : "";
+
+            if (res instanceof AST.List) ret += "[" + res.list.length + "]"
+            if (ret !== "") {
+                console.log(indent + "┕" + fn_name + ": " + ret)
+            } else {
+                console.log(indent + "┊" + fn_name)
+            }
+
+
+            return res;
+        };
     }
 }
 
@@ -1037,5 +1536,5 @@ let tokens = parser.parse();
 
 for (let token of tokens) {
     // if (token.type == TOKEN.VAR)
-    console.log(token.toString());
+    console.log(token.toJSON());
 }
