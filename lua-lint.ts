@@ -3,7 +3,7 @@ import { readFileSync } from 'fs';
 import { LETTERS, DIGITS, IDENT_CHARS, SIMPLE_SYMBOLS } from './char';
 import { AST, Literal, Alternating_Array, No_Trailing_Array } from './ast_util';
 
-let TRACE_EXECUTION = false;
+let TRACE_EXECUTION = true;
 
 
 if (process.argv.some(a => a === "--trace")) {
@@ -255,6 +255,7 @@ type Field_Sep = AST.SYMBOL<","> | AST.SYMBOL<";">;
 
 class Field_List extends AST.Delimited_Trailing<Field, Field_Sep> {
     static type = AST.NODE.FIELD_LIST;
+    static allow_empty = true;
 }
 
 class Return_Statement extends AST.Prefixed<AST.KEYWORD<"return">, Expr_List> {
@@ -412,6 +413,11 @@ type RequiredTypes<T> = {
     [K in keyof T]: NonNullable<T[K]>
 }
 
+type Column<T extends any[], COL extends number> = {
+    [K in keyof T]: T[K][COL]
+}
+
+
 function memoized<A, B>(fn: (a:A)=>B) {
     const cache = new Map<A, B>();
 
@@ -427,21 +433,22 @@ function replaceAt(str: string, index: number, replacement: string) {
     return str.substring(0, index) + replacement + str.substring(index + replacement.length);
 }
 
+// @TODO: Parsing errors
+// Every function that returns a node should optionally
+// also return an error.
+// Then other functions can handle the error or
+// propagate it upwards, perhaps with additional
+// information.
+
 class Parser {
-    text: string;
     start = new AST.Position(0, 0);
     current = new AST.Position(0, 0);
 
-    constructor(text: string) {
-        this.text = text;
-    }
+    constructor(public text: string) {}
 
     char(add=0) { return this.text[this.current.index+add]; }
     move(amt=1) { this.current.move(amt); }
-    rollback(token?: AST.Node) {
-        let pos = (token||this).start;
-        this.current.set((token||this).start);
-    }
+    rollback(token?: AST.Node) { this.current.set((token||this).start); }
     at_end() { return this.current.index >= this.text.length; }
 
     current_text() {
@@ -522,18 +529,25 @@ class Parser {
         }
     }
 
-    ident() {
+    ident(allow_keyword: boolean) {
         this.skip_ws();
         if (this.at_end()) return undefined;
         let c = this.char();
         if (LETTERS.includes(c) || c == "_") {
             this.move();
             while (IDENT_CHARS.includes(this.char())) this.move();
-            return this.ast_node(Identifier);
+            let node = this.ast_node(Identifier);
+            if (AST.Keywords[node.text as keyof AST.KEYWORDS] && !allow_keyword) {
+                this.rollback(node);
+                return undefined;
+            }
+            return node;
         } else {
             return undefined;
         }
     }
+
+    ident_no_keyword() { return this.ident(false); }
 
     num() {
         this.skip_ws();
@@ -753,7 +767,7 @@ class Parser {
         FN extends (() => (AST.Node | undefined))[]
     >(
         ...fns: FN
-    ): ReturnTypes<typeof fns>[number] | undefined {
+    ): ReturnTypes<FN>[number] | undefined {
         this.skip_ws();
         if (this.at_end()) return undefined;
         for (let fn of fns) {
@@ -764,17 +778,51 @@ class Parser {
         return undefined;
     }
 
+    preferential_either<
+        FN extends [() => (AST.Node | undefined), ()=>number][]
+    >(
+        bail_on_all_zeroes: boolean,
+        ...fns: FN
+    ) {
+        this.skip_ws();
+        let nonzero = false;
+
+        let sorted = fns.sort(
+            (a, b) => {
+                let ar = a[1]();
+                let br = b[1]();
+                nonzero = nonzero || ar != 0 || br != 0;
+                return br - ar;
+            }
+        );
+
+        if (bail_on_all_zeroes && !nonzero) { return undefined; }
+
+        let mapped = sorted.map(a => a[0]) as unknown as Column<FN, 0>;
+        return this.either(
+            ...mapped
+        );
+    }
+
     alternating<
         FNA extends (() => (AST.Node | undefined)),
         FNB extends (() => (AST.Node | undefined))
     >(
         fn_a: FNA,
-        fn_b: FNB
+        fn_b: FNB,
+        allow_empty: boolean
     ) {
         this.skip_ws();
         let first = fn_a.call(this);
-        if (!first) { return undefined; }
-        let args = [first];
+        if (!first) {
+            if (allow_empty) {
+                return [] as unknown as Alternating_Array<
+                    NonNullable<ReturnType<FNA>>,
+                    NonNullable<ReturnType<FNB>>
+                >;
+            }
+            return undefined;
+        }        let args = [first];
         while (true) {
             let b = fn_b.call(this);
             if (!b) break;
@@ -837,7 +885,7 @@ class Parser {
     name() {
         this.skip_ws();
         if (this.at_end()) return undefined;
-        let ident = this.ident();
+        let ident = this.ident(false);
         if (!ident) { return undefined; }
         if (ident.text in AST.Keywords) { this.rollback(ident); return undefined; }
         return ident;
@@ -853,23 +901,43 @@ class Parser {
         return new Unary_Operator(this, op.start, op.end);
     }
 
+    text_start_preference(str: string, weight=1) {
+        return () => {
+            return this.text.startsWith(str, this.current.index) ? weight : 0;
+        }
+    }
+
+    number_start_preference(weight=1) {
+        return () => {
+            return this.char().match(/[0-9]/) ? weight : 0
+        }
+    }
+
+    string_start_preference(weight=1) {
+        return () => {
+            let char = this.char()
+            return (char === '"' || char === "'") ? weight : 0;
+        }
+    }
+
     binop(): Binary_Operator|undefined {
-        let op = this.either(
-            this.symbol_matcher("+"),
-            this.symbol_matcher("-"),
-            this.symbol_matcher("*"),
-            this.symbol_matcher("/"),
-            this.symbol_matcher("^"),
-            this.symbol_matcher("%"),
-            this.symbol_matcher(".."),
-            this.symbol_matcher("<"),
-            this.symbol_matcher(">"),
-            this.symbol_matcher("<="),
-            this.symbol_matcher(">="),
-            this.symbol_matcher("=="),
-            this.symbol_matcher("~="),
-            this.keyword_matcher("and"),
-            this.keyword_matcher("or"),
+        let op = this.preferential_either(
+            true,
+            [this.symbol_matcher("+"), this.text_start_preference("+")],
+            [this.symbol_matcher("-"), this.text_start_preference("-")],
+            [this.symbol_matcher("*"), this.text_start_preference("*")],
+            [this.symbol_matcher("/"), this.text_start_preference("/")],
+            [this.symbol_matcher("^"), this.text_start_preference("^")],
+            [this.symbol_matcher("%"), this.text_start_preference("%")],
+            [this.symbol_matcher(".."), this.text_start_preference("..")],
+            [this.symbol_matcher("<"), this.text_start_preference("<")],
+            [this.symbol_matcher(">"), this.text_start_preference(">")],
+            [this.symbol_matcher("<="), this.text_start_preference("<=", 2)],
+            [this.symbol_matcher(">="), this.text_start_preference(">=", 2)],
+            [this.symbol_matcher("=="), this.text_start_preference("==", 2)],
+            [this.symbol_matcher("~="), this.text_start_preference("~=")],
+            [this.keyword_matcher("and"), this.text_start_preference("and")],
+            [this.keyword_matcher("or"), this.text_start_preference("or")],
         );
         if (!op) return undefined;
         return new Binary_Operator(this, op.start, op.end);
@@ -878,7 +946,7 @@ class Parser {
     prefix(): Prefix|undefined {
         return this.either(
             () => this.parens(this.expr),
-            this.ident
+            this.ident_no_keyword
         );
     }
 
@@ -916,7 +984,7 @@ class Parser {
     named_field(): Named_Field|undefined {
         let seq = this.sequence(
             () => this.either(
-                this.ident,
+                this.ident_no_keyword,
                 () => this.brackets(this.expr)
             ),
             this.symbol_matcher("="),
@@ -927,30 +995,32 @@ class Parser {
     }
 
     field_sep(): Field_Sep|undefined {
-        return this.either(
-            this.symbol_matcher(","),
-            this.symbol_matcher(";")
+        return this.preferential_either(
+            true,
+            [this.symbol_matcher(","), this.text_start_preference(",")],
+            [this.symbol_matcher(";"), this.text_start_preference(";")]
         );
     }
 
     field_list(): Field_List|undefined {
-        let fields = this.alternating(this.field, this.field_sep)
+        let fields = this.alternating(this.field, this.field_sep, true)
         if (!fields) return undefined;
         return new Field_List(this, fields);
     }
 
     args(): Args|undefined {
-        return this.either(
-            this.str,
-            this.table,
-            () => this.parens(() => this.expr_list(true))
+        return this.preferential_either(
+            false,
+            [this.str, this.string_start_preference()],
+            [this.table, this.text_start_preference("{")],
+            [() => this.parens(() => this.expr_list(true)), this.text_start_preference("(")]
         );
     }
 
     method_name(): Method_Name|undefined {
         let seq = this.sequence(
             this.symbol_matcher(":"),
-            this.ident
+            this.ident_no_keyword
         );
         if (!seq) return undefined;
         return new Method_Name(this, {
@@ -988,17 +1058,19 @@ class Parser {
     }
 
     value(): Value|undefined {
-        return this.either(
-            this.keyword_matcher("nil"),
-            this.keyword_matcher("false"),
-            this.keyword_matcher("true"),
-            this.num, this.str,
-            this.symbol_matcher("..."),
-            this.func,
-            this.table,
-            this.function_call,
-            this.variable,
-            () => this.parens(this.expr),
+        return this.preferential_either(
+            false,
+            [this.keyword_matcher("nil"), this.text_start_preference("nil")],
+            [this.keyword_matcher("false"), this.text_start_preference("false")],
+            [this.keyword_matcher("true"), this.text_start_preference("true")],
+            [this.num, this.number_start_preference()],
+            [this.str, this.string_start_preference()],
+            [this.symbol_matcher("..."), this.text_start_preference("...")],
+            [this.func, this.text_start_preference("function")],
+            [this.table, this.text_start_preference("{")],
+            [this.function_call, () => 0],
+            [this.variable, () => 0],
+            [() => this.parens(this.expr), this.text_start_preference("(")],
         );
     }
 
@@ -1006,7 +1078,7 @@ class Parser {
         this.skip_ws();
         if (this.at_end()) return undefined;
 
-        let ident = this.ident();
+        let ident = this.ident(true);
         if (!ident) { return undefined; }
         if (!(ident.text in AST.Keywords)) {
             this.rollback(ident);
@@ -1057,7 +1129,7 @@ class Parser {
         this.skip_ws();
         let seq = this.sequence(
             this.symbol_matcher("."),
-            this.ident
+            this.ident_no_keyword
         );
         if (!seq) return undefined;
         return new Dot_Access(this, {
@@ -1080,29 +1152,18 @@ class Parser {
             this.suffixes
         );
         if (!seq) return undefined;
-
         let suffixes = seq[1];
 
-        let list = [...suffixes.list];
-        let last_suffix = list.at(-1);
-        let last_rejected: AST.Node|undefined = undefined;
-
-        while (last_suffix && is_call(last_suffix)) {
-            last_rejected = list.pop();
-            last_suffix = list.at(-1);
-        }
-
-        if (!last_suffix) {
+        let last_suffix = suffixes.list.at(-1);
+        if (last_suffix === undefined || is_call(last_suffix)) {
             this.rollback(seq[0]);
             return undefined;
         }
 
-        let index = list.pop() as Index;
+        let index = suffixes.list.pop() as Index;
 
-        this.rollback(last_rejected);
-        suffixes.list = list;
-        if (list.length > 0) {
-            suffixes.withPos(...list);
+        if (suffixes.list.length > 0) {
+            suffixes.end.set(suffixes.list.at(-1)!.end);
         } else {
             suffixes.end.set(suffixes.start);
         }
@@ -1113,7 +1174,7 @@ class Parser {
     variable(): Var|undefined {
         let val = this.either(
             this.index_access,
-            this.ident
+            this.ident_no_keyword
         );
         if (!val) return undefined;
         return new Var(this, val);
@@ -1148,26 +1209,16 @@ class Parser {
         if (!seq) return undefined;
         let suffixes = seq[1];
 
-        let list = [...suffixes.list];
-        let last_suffix = list.at(-1);
-        let last_rejected: AST.Node|undefined = undefined;
-
-        while (last_suffix && !is_call(last_suffix)) {
-            last_rejected = list.pop();
-            last_suffix = list.at(-1);
-        }
-
-        if (!last_suffix) {
+        let last_suffix = suffixes.list.at(-1);
+        if (last_suffix === undefined || !is_call(last_suffix)) {
             this.rollback(seq[0]);
             return undefined;
         }
 
-        let call = list.pop() as Call;
+        let call = suffixes.list.pop() as Call;
 
-        this.rollback(last_rejected);
-        suffixes.list = list;
-        if (list.length > 0) {
-            suffixes.withPos(...list);
+        if (suffixes.list.length > 0) {
+            suffixes.end.set(suffixes.list.at(-1)!.end);
         } else {
             suffixes.end.set(suffixes.start);
         }
@@ -1223,8 +1274,8 @@ class Parser {
         });
     }
 
-    namelist(allow_empty: boolean): Identifier_List | undefined {
-        let l = this.no_trailing(this.ident, this.symbol_matcher(","), allow_empty);
+    namelist(): Identifier_List | undefined {
+        let l = this.no_trailing(this.ident_no_keyword, this.symbol_matcher(","), false);
         if (!l) return undefined;
         return new Identifier_List(this, l);
     }
@@ -1244,7 +1295,7 @@ class Parser {
     local_var_decl(): Local_Var_Decl|undefined {
         let seq = this.sequence(
             this.keyword_matcher("local"),
-            () => this.namelist(false)
+            this.namelist
         );
         if (!seq) return undefined;
         return new Local_Var_Decl(this, {
@@ -1255,7 +1306,7 @@ class Parser {
     }
 
     func_name_no_method(): Func_Name_No_Method|undefined {
-        let args = this.no_trailing(this.ident, this.symbol_matcher("."), false);
+        let args = this.no_trailing(this.ident_no_keyword, this.symbol_matcher("."), false);
         if (!args) return undefined;
         return new Func_Name_No_Method(this, args);
     }
@@ -1282,7 +1333,7 @@ class Parser {
     }
 
     param_list(): Param_List|undefined {
-        let params = this.namelist(false);
+        let params = this.namelist();
         if (!params) return undefined;
 
         return new Param_List(this, {
@@ -1389,19 +1440,81 @@ class Parser {
         });
     }
 
+    for_step(): For_Step|undefined {
+        let seq = this.sequence(
+            this.symbol_matcher(","),
+            this.expr
+        );
+        if (!seq) return undefined;
+        return new For_Step(this, {
+            comma: seq[0],
+            step: seq[1]
+        });
+    }
+
+    for_loop(): For|undefined {
+        let seq = this.sequence(
+            this.keyword_matcher("for"),
+            this.ident_no_keyword,
+            this.symbol_matcher("="),
+            this.expr,
+            this.symbol_matcher(","),
+            this.expr
+        );
+
+        if (!seq) return undefined;
+        let step = this.for_step();
+
+        let block = this.do_block();
+        if (!block) {
+            this.rollback(seq[0]);
+            return undefined;
+        }
+
+        return new For(this, {
+            for_keyword: seq[0],
+            name: seq[1],
+            assign: seq[2],
+            init: seq[3],
+            comma: seq[4],
+            end: seq[5],
+            step: step,
+            block: block
+        });
+    }
+
+    for_in_loop(): For_In|undefined {
+        let seq = this.sequence(
+            this.keyword_matcher("for"),
+            this.namelist,
+            this.keyword_matcher("in"),
+            () => this.expr_list(false),
+            this.do_block
+        );
+        if (!seq) return undefined;
+        return new For_In(this, {
+            for_keyword: seq[0],
+            names: seq[1],
+            in_keyword: seq[2],
+            exprs: seq[3],
+            block: seq[4]
+        })
+    }
+
     statement(): Statement|undefined {
-        return this.either(
-            this.assign,
-            this.function_call,
-            this.do_block,
-            this.while_loop,
-             // @TODO: repeat |
-             this.if_statement,
-             // @TODO: `for` ident `=´ exp `,´ exp [`,´ exp] doblock |
-             // @TODO: `for` namelist `in` explist doblock |
-             this.func_decl,
-             // @TODO: `local` `function` ident funcbody |
-             this.local_var_decl,
+        return this.preferential_either(
+            false,
+            [this.assign, () => 0],
+            [this.function_call, () => 0],
+            [this.do_block, this.text_start_preference("do")],
+            [this.while_loop, this.text_start_preference("while")],
+            // @TODO: repeat |
+            [this.if_statement, this.text_start_preference("if")],
+            [this.for_loop, this.text_start_preference("for")],
+            [this.for_in_loop, this.text_start_preference("for", 2)],
+            [this.func_decl, this.text_start_preference("function")],
+            // @TODO: `local` `function` ident funcbody |
+            [this.local_var_decl, this.text_start_preference("local")],
         );
     }
 
@@ -1442,6 +1555,7 @@ class Parser {
                 tokens.push(tok);
                 continue;
             }
+            console.log("Failed to parse:\n" + this.context());
             break;
         }
         return tokens;
@@ -1455,8 +1569,9 @@ const SKIP_FNS = [
     "keyword", "symbol", "list",
     "rollback", "<anonymous>",
     "keyword_", "symbol_", "current_text",
-    "ast_node", "exact_symbol", "ident",
-    "long_bracket"
+    "ast_node",  "ident", "text_start_preference",
+    "long_bracket", "preferential_either",
+    "number_start_preference", "string_start_preference"
 ];
 
 function includes_skip(str: string): boolean {
@@ -1487,6 +1602,9 @@ function get_depth() {
     return f.length;
 }
 
+const TRACE_START = 0;
+const TRACE_END = 999;
+
 if (TRACE_EXECUTION) {
     Error.stackTraceLimit = Infinity;
     let proto = Parser.prototype as any;
@@ -1503,6 +1621,14 @@ if (TRACE_EXECUTION) {
         if (fn_name === "Parser") continue;
         if (SKIP_FNS.includes(fn_name)) continue;
         proto[fn_name] = function(...args: any[]) {
+            if (this.current.line < TRACE_START) {
+                return fn.call(this, ...args);
+            }
+
+            if (this.current.line > TRACE_END) {
+                throw new Error("OOPS");
+            }
+
             let first_string_arg = args.length === 1 ? args[0] : "";
             if (typeof first_string_arg !== "string") first_string_arg = "";
             let depth = get_depth();
@@ -1524,7 +1650,6 @@ if (TRACE_EXECUTION) {
                 console.log(indent + "┊" + fn_name)
             }
 
-
             return res;
         };
     }
@@ -1536,5 +1661,5 @@ let tokens = parser.parse();
 
 for (let token of tokens) {
     // if (token.type == TOKEN.VAR)
-    console.log(token.toJSON());
+    // console.log(token.toJSON());
 }

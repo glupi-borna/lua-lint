@@ -280,7 +280,6 @@ export namespace AST {
             args: Alternating_Array<T, DELIMITER>
         ) {
             super(parser, args);
-            this.withPos(...args);
         }
     }
 
