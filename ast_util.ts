@@ -80,7 +80,7 @@ export namespace AST {
         VAR_ARGS, PARAMS, FUNC_DECL, LOCAL_FUNC_DECL,
         ASSIGN_EXPRS, LOCAL_VAR_DECL, FOR, FOR_STEP, FOR_IN,
 
-        STATEMENT_LIST, IDENTIFIER_LIST, VAR_LIST,
+        STATEMENT, STATEMENT_LIST, IDENTIFIER_LIST, VAR_LIST,
         EXPR_LIST, FIELD_LIST_WITH_TRAILER, FIELD_LIST,
         ELSEIF_LIST,
 
@@ -144,6 +144,8 @@ export namespace AST {
     export class Node {
         static type: NODE = NODE.UNKNOWN;
         static allow_empty = false;
+        static json_keys = ["text"];
+
         start: Position;
         end: Position;
 
@@ -186,6 +188,10 @@ export namespace AST {
             return this;
         }
 
+        get json_keys() {
+            return (this.constructor as typeof Node).json_keys;
+        }
+
         keys() {
             return Object.keys(this).
                 concat("text", "kind")
@@ -201,13 +207,11 @@ export namespace AST {
 
         toJSON() {
             let props: any = {};
-            for (let key of this.keys()) {
+            props.$name = this.kind;
+            for (let key of this.json_keys) {
                 props[key] = (this as any)[key];
             }
-            return [
-                this.constructor.name,
-                props
-            ];
+            return props;
         }
     }
 
@@ -218,6 +222,7 @@ export namespace AST {
     }
 
     export abstract class Sequence<T extends Record<string, Node>> extends Node {
+        static json_keys = ["fields"];
         constructor(
             parser: Parser,
             public fields: T
@@ -245,6 +250,8 @@ export namespace AST {
     }> {}
 
     export abstract class List<T extends Node> extends Node {
+        static json_keys = ["list"];
+
         constructor(
             parser: Parser,
             public list: T[]

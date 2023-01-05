@@ -1,9 +1,10 @@
 import { default as assert } from 'assert';
 import { readFileSync } from 'fs';
+import { print, flush } from './utils';
 import { LETTERS, DIGITS, IDENT_CHARS, SIMPLE_SYMBOLS } from './char';
 import { AST, Literal, Alternating_Array, No_Trailing_Array } from './ast_util';
 
-let TRACE_EXECUTION = true;
+let TRACE_EXECUTION = false;
 
 
 if (process.argv.some(a => a === "--trace")) {
@@ -150,11 +151,17 @@ class Var_Args extends AST.Prefixed<AST.SYMBOL<",">, AST.SYMBOL<"...">> {
     static type = AST.NODE.VAR_ARGS;
 }
 
+class Param_Names extends AST.Delimited_Trailing<Identifier, AST.SYMBOL<",">> {
+    static type = AST.NODE.IDENTIFIER_LIST;
+    static allow_empty = true;
+}
+
 class Param_List extends AST.Sequence<{
-    params: Identifier_List,
+    params: Param_Names,
     varargs?: Var_Args
 }> {
     static type = AST.NODE.PARAMS;
+    static allow_empty = true;
 }
 
 type Params = AST.SYMBOL<"..."> | Param_List;
@@ -172,6 +179,7 @@ class Var extends AST.Wrapper<Index_Access|Identifier> { static type = AST.NODE.
 
 class Binary_Operation extends AST.Node {
     static type = AST.NODE.BINARY_OPERATION;
+    static json_keys = ["left", "op", "right"];
 
     constructor(
         parser: Parser,
@@ -185,6 +193,7 @@ class Binary_Operation extends AST.Node {
 
 class Unary_Operation extends AST.Node {
     static type = AST.NODE.UNARY_OPERATION;
+    static json_keys = ["op", "exp"];
 
     constructor(
         parser: Parser,
@@ -245,8 +254,7 @@ class Named_Field extends AST.Node {
         public equals: AST.SYMBOL<"=">,
         public expression: Expr
     ) {
-        super(parser);
-        this.withPos(name, equals, expression);
+        super(parser, name.start, expression.end);
     }
 }
 
@@ -399,11 +407,19 @@ class For_In extends AST.Sequence<{
     static type = AST.NODE.FOR_IN;
 }
 
+type Statement_Value = Assign | Func_Call | Do_Block | While | Repeat | If | For_In | For | Local_Var_Decl | Local_Func_Decl | Func_Decl;
+
+class Statement extends AST.Sequence<{
+    value: Statement_Value,
+    semi?: AST.SYMBOL<";">
+}> {
+    static type = AST.NODE.STATEMENT;
+}
+
 class Statement_List extends AST.List<Statement> {
     static type = AST.NODE.STATEMENT_LIST;
 }
 
-type Statement = Assign | Func_Call | Do_Block | While | Repeat | If | For_In | For | Local_Var_Decl | Local_Func_Decl | Func_Decl;
 
 type DropFirst<T extends unknown[]> = T extends [any, ...infer U] ? U : never;
 type ReturnTypes<T> = {
@@ -418,15 +434,18 @@ type Column<T extends any[], COL extends number> = {
 }
 
 
-function memoized<A, B>(fn: (a:A)=>B) {
-    const cache = new Map<A, B>();
+function memoized<
+    FN extends (...args: any[]) => any
+>(fn: FN): FN {
+    const cache = new Map<string, ReturnType<FN>>();
 
-    return (a: A) => {
-        if (cache.has(a)) return cache.get(a) as B;
-        let b = fn(a);
-        cache.set(a, b);
+    return ((...args: Parameters<FN>) => {
+        let cache_name = args.join(" ");
+        if (cache.has(cache_name)) return cache.get(cache_name) as ReturnType<FN>;
+        let b: ReturnType<FN> = fn(...args);
+        cache.set(cache_name, b);
         return b;
-    };
+    }) as FN;
 }
 
 function replaceAt(str: string, index: number, replacement: string) {
@@ -455,12 +474,14 @@ class Parser {
         return this.text.substring(this.start.index, this.current.index);
     }
 
-    context() {
+    context(with_ln=false) {
         let lines = this.text.split("\n");
         let firstchar = lines.slice(0, this.start.line).join("\n").length+1;
         let realchar = this.start.index;
         let offset = realchar - firstchar;
-        return replaceAt(lines[this.start.line], offset, "^");
+        let txt = replaceAt(lines[this.start.line], offset, "^");
+        if (with_ln) { return this.start.line + ": " + txt; }
+        return txt;
     }
 
     ast_node<
@@ -478,7 +499,7 @@ class Parser {
     trace(msg: string) {
         let stack = (new Error()).stack;
         if (!stack) return;
-        console.log(
+        print(
             msg + ":\n" +
             "context: \n" + this.context() + "\n" +
             stack
@@ -611,10 +632,14 @@ class Parser {
         while (this.char() == "=" && !this.at_end()) { level++; this.move(); }
         if (this.char() != "[") { this.rollback(); return undefined; }
         this.move();
+        if (this.char() == "\n") { this.current.nextLine(); }
 
         while (!this.at_end()) {
-            if (this.char() == "\n") { this.current.nextLine(); }
-            while (this.char() != "]" && !this.at_end()) { this.move(); }
+            while (this.char() != "]" && !this.at_end()) {
+                this.move();
+                if (this.char() == "\n") { this.current.nextLine(); }
+            }
+
             if (this.char() != "]") {
                 this.rollback();
                 return undefined;
@@ -628,7 +653,8 @@ class Parser {
             if (local_level != level) { continue; }
             if (this.char() != "]") { continue; }
             this.move();
-            return this.ast_node(token_type);
+            let lb = this.ast_node(token_type);
+            return lb;
         }
 
         this.rollback();
@@ -804,6 +830,69 @@ class Parser {
         );
     }
 
+    text_start_preference = memoized((str: string, weight: number = 1) => {
+        return () => {
+            return this.text.startsWith(str, this.current.index) ? weight : 0;
+        };
+    });
+
+    number_start_preference = memoized((weight: number = 1) => {
+        return () => {
+            return this.char().match(/[0-9]/) ? weight : 0
+        };
+    });
+
+    string_start_preference = memoized((weight: number = 1) => {
+        return () => {
+            let char = this.char();
+            return (char === '"' || char === "'" || char === "[") ? weight : 0;
+        };
+    });
+
+    identifier_start_preference = memoized((weight: number = 1) => {
+        return () => {
+            let char = this.char();
+            return (LETTERS.includes(char) || char === "_") ? weight : 0;
+        };
+    });
+
+    prefix_start_preference = memoized((weight: number = 1) => {
+        return () => {
+            let char = this.char();
+            return (char === "(" || this.identifier_start_preference()()) ? weight : 0;
+        };
+    });
+
+    suffix_start_preference = memoized((weight: number = 1) => {
+        return () => {
+            let char = this.char();
+            return (char === "." || char === "[" || char === "(" || char === ":" || char === "{" || this.string_start_preference()()) ? weight : 0;
+        };
+    });
+
+    value_start_preference = memoized((weight: number = 1) => {
+        return () => {
+            let char = this.char();
+            return (
+                char === "{" || char === "(" ||
+                this.identifier_start_preference()() ||
+                this.number_start_preference()() ||
+                this.string_start_preference()() ||
+                this.text_start_preference("...")()
+            ) ? weight : 0;
+        };
+    });
+
+    unop_start_preference = memoized((weight: number = 1) => {
+        return () => {
+            return (
+                this.text_start_preference("-")() ||
+                this.text_start_preference("not")() ||
+                this.text_start_preference("#")()
+            ) ? weight : 0;
+        };
+    });
+
     alternating<
         FNA extends (() => (AST.Node | undefined)),
         FNB extends (() => (AST.Node | undefined))
@@ -892,32 +981,14 @@ class Parser {
     }
 
     unop(): Unary_Operator|undefined {
-        let op = this.either(
-            this.symbol_matcher("-"),
-            this.keyword_matcher("not"),
-            this.symbol_matcher("#"),
+        let op = this.preferential_either(
+            true,
+            [this.symbol_matcher("-"), this.text_start_preference("-")],
+            [this.keyword_matcher("not"), this.text_start_preference("not")],
+            [this.symbol_matcher("#"), this.text_start_preference("#")],
         );
         if (!op) return undefined;
         return new Unary_Operator(this, op.start, op.end);
-    }
-
-    text_start_preference(str: string, weight=1) {
-        return () => {
-            return this.text.startsWith(str, this.current.index) ? weight : 0;
-        }
-    }
-
-    number_start_preference(weight=1) {
-        return () => {
-            return this.char().match(/[0-9]/) ? weight : 0
-        }
-    }
-
-    string_start_preference(weight=1) {
-        return () => {
-            let char = this.char()
-            return (char === '"' || char === "'") ? weight : 0;
-        }
     }
 
     binop(): Binary_Operator|undefined {
@@ -951,6 +1022,8 @@ class Parser {
     }
 
     suffix(): Suffix|undefined {
+        this.skip_ws();
+        if (this.suffix_start_preference()() === 0) return undefined;
         return this.either(
             this.call,
             this.index
@@ -958,6 +1031,8 @@ class Parser {
     }
 
     suffixes(): Suffixes {
+        this.skip_ws();
+        if (this.suffix_start_preference()() === 0) return new Suffixes(this, []);
         let suffixes = this.list(this.suffix);
         return new Suffixes(this, suffixes);
     }
@@ -1010,7 +1085,7 @@ class Parser {
 
     args(): Args|undefined {
         return this.preferential_either(
-            false,
+            true,
             [this.str, this.string_start_preference()],
             [this.table, this.text_start_preference("{")],
             [() => this.parens(() => this.expr_list(true)), this.text_start_preference("(")]
@@ -1059,7 +1134,7 @@ class Parser {
 
     value(): Value|undefined {
         return this.preferential_either(
-            false,
+            true,
             [this.keyword_matcher("nil"), this.text_start_preference("nil")],
             [this.keyword_matcher("false"), this.text_start_preference("false")],
             [this.keyword_matcher("true"), this.text_start_preference("true")],
@@ -1068,8 +1143,8 @@ class Parser {
             [this.symbol_matcher("..."), this.text_start_preference("...")],
             [this.func, this.text_start_preference("function")],
             [this.table, this.text_start_preference("{")],
-            [this.function_call, () => 0],
-            [this.variable, () => 0],
+            [this.function_call, this.prefix_start_preference()],
+            [this.variable, this.prefix_start_preference()],
             [() => this.parens(this.expr), this.text_start_preference("(")],
         );
     }
@@ -1089,15 +1164,14 @@ class Parser {
         return kwd;
     }
 
-    binary_operation(): Binary_Operation|undefined {
+    binary_operation(value: Value): Binary_Operation | Value | undefined {
         this.skip_ws();
         let seq = this.sequence(
-            this.value,
             this.binop,
             this.expr
         );
-        if (!seq) return undefined;
-        return new Binary_Operation(this, ...seq);
+        if (!seq) return value;
+        return new Binary_Operation(this, value, ...seq);
     }
 
     unary_operation(): Unary_Operation|undefined {
@@ -1107,18 +1181,25 @@ class Parser {
         return new Unary_Operation(this, ...seq);
     }
 
+    binary_op_or_value() {
+        this.skip_ws();
+        let value = this.value();
+        if (!value) return undefined;
+        return this.binary_operation(value);
+    }
+
     expr(): Expr|undefined {
-        return this.either(
-            this.binary_operation,
-            this.unary_operation,
-            this.value
+        return this.preferential_either(
+            true,
+            [this.binary_op_or_value, this.value_start_preference()],
+            [this.unary_operation, this.unop_start_preference()]
         );
     }
 
     list<K extends AST.Node>(fn: () => K|undefined): K[] {
         let arr = [];
         let tok = fn.call(this);
-        while (tok) {
+        while (tok && !this.at_end()) {
             arr.push(tok);
             tok = fn.call(this);
         }
@@ -1332,8 +1413,18 @@ class Parser {
         });
     }
 
+    param_names(): Param_Names|undefined {
+        let param_names = this.alternating(
+            this.ident_no_keyword,
+            this.symbol_matcher(","),
+            true
+        );
+        if (!param_names) return undefined;
+        return new Param_Names(this, param_names);
+    }
+
     param_list(): Param_List|undefined {
-        let params = this.namelist();
+        let params = this.param_names();
         if (!params) return undefined;
 
         return new Param_List(this, {
@@ -1342,16 +1433,9 @@ class Parser {
         });
     }
 
-    params(): Params|undefined {
-        return this.either(
-            this.param_list,
-            this.symbol_matcher("...")
-        );
-    }
-
     func_body(): Func_Body|undefined {
         let seq = this.sequence(
-            () => this.parens(this.params),
+            () => this.parens(this.param_list),
             this.block,
             this.keyword_matcher("end")
         );
@@ -1501,21 +1585,60 @@ class Parser {
         })
     }
 
+    local_func_decl(): Local_Func_Decl|undefined {
+        let seq = this.sequence(
+            this.keyword_matcher("local"),
+            this.keyword_matcher("function"),
+            this.ident_no_keyword,
+            this.func_body
+        );
+        if (!seq) return undefined;
+        return new Local_Func_Decl(this, {
+            local_keyword: seq[0],
+            func_keyword: seq[1],
+            name: seq[2],
+            body: seq[3]
+        });
+    }
+
+    repeat(): Repeat|undefined {
+        let seq = this.sequence(
+            this.keyword_matcher("repeat"),
+            this.block,
+            this.keyword_matcher("until"),
+            this.expr
+        );
+        if (!seq) return undefined;
+
+        return new Repeat(this, {
+            repeat_keyword: seq[0],
+            block: seq[1],
+            until_keyword: seq[2],
+            condition: seq[3]
+        });
+    }
+
     statement(): Statement|undefined {
-        return this.preferential_either(
+        let stat = this.preferential_either(
             false,
             [this.assign, () => 0],
-            [this.function_call, () => 0],
+            [this.function_call, this.prefix_start_preference(.5)],
             [this.do_block, this.text_start_preference("do")],
             [this.while_loop, this.text_start_preference("while")],
-            // @TODO: repeat |
+            [this.repeat, this.text_start_preference("repeat")],
             [this.if_statement, this.text_start_preference("if")],
             [this.for_loop, this.text_start_preference("for")],
             [this.for_in_loop, this.text_start_preference("for", 2)],
             [this.func_decl, this.text_start_preference("function")],
-            // @TODO: `local` `function` ident funcbody |
+            [this.local_func_decl, this.text_start_preference("local function", 2)],
             [this.local_var_decl, this.text_start_preference("local")],
         );
+        if (!stat) return undefined;
+        let semi = this.exact_symbol(";");
+        return new Statement(this, {
+            value: stat,
+            semi: semi
+        });
     }
 
     statement_list(): Statement_List {
@@ -1555,7 +1678,7 @@ class Parser {
                 tokens.push(tok);
                 continue;
             }
-            console.log("Failed to parse:\n" + this.context());
+            console.log("Failed to parse:\n" + this.context(true));
             break;
         }
         return tokens;
@@ -1567,11 +1690,13 @@ const SKIP_FNS = [
     "at_end", "skip_ws", "either",
     "sequence", "context", "exact",
     "keyword", "symbol", "list",
-    "rollback", "<anonymous>",
+    "<anonymous>", "rollback",
     "keyword_", "symbol_", "current_text",
     "ast_node",  "ident", "text_start_preference",
     "long_bracket", "preferential_either",
-    "number_start_preference", "string_start_preference"
+    "number_start_preference", "string_start_preference",
+    "prefix_start_preference", "suffix_start_preference",
+    "value_start_preference"
 ];
 
 function includes_skip(str: string): boolean {
@@ -1584,32 +1709,15 @@ function includes_skip(str: string): boolean {
     return false;
 }
 
-function get_depth() {
-    let stack = (new Error()).stack;
-    if (!stack) return 0;
-    let f = stack.split("\n")
-        .filter(s =>
-            s !== "Error" &&
-            !includes_skip(s) &&
-            !s.includes("get_depth") &&
-            !s.includes("Object.") &&
-            !s.includes("Module.") &&
-            !s.includes("Function.") &&
-            !s.includes("node:internal/") &&
-            true
-        );
-    // console.log(f);
-    return f.length;
-}
-
 const TRACE_START = 0;
-const TRACE_END = 999;
+const TRACE_END = 100000;
 
 if (TRACE_EXECUTION) {
-    Error.stackTraceLimit = Infinity;
     let proto = Parser.prototype as any;
     let keys = Object.getOwnPropertyNames(proto);
     let moved = false;
+    let depth = 0;
+
     for (let fn_name of keys) {
         let fn = proto[fn_name] as (...args: any[]) => any;
         if (fn_name === "move" || fn_name === "rollback") {
@@ -1620,7 +1728,10 @@ if (TRACE_EXECUTION) {
         }
         if (fn_name === "Parser") continue;
         if (SKIP_FNS.includes(fn_name)) continue;
+
         proto[fn_name] = function(...args: any[]) {
+            depth++;
+
             if (this.current.line < TRACE_START) {
                 return fn.call(this, ...args);
             }
@@ -1631,21 +1742,21 @@ if (TRACE_EXECUTION) {
 
             let first_string_arg = args.length === 1 ? args[0] : "";
             if (typeof first_string_arg !== "string") first_string_arg = "";
-            let depth = get_depth();
             let indent = "┊ ".repeat(depth);
             let ctx = "";
-            if (depth > 3 && moved) {
+            if (depth > 3 && (moved || fn_name === "statement")) {
                 ctx = this.context();
                 moved = false;
             }
-            let str = (indent + fn_name + " " + first_string_arg).padEnd(60) + ctx;
+            let str = (indent + fn_name + " " + first_string_arg).padEnd(80) + ctx;
             console.log(str);
             let res = fn.call(this, ...args);
+            depth--;
             let ret = res instanceof AST.Node ? `${res.kind}` : "";
 
             if (res instanceof AST.List) ret += "[" + res.list.length + "]"
             if (ret !== "") {
-                console.log(indent + "┕" + fn_name + ": " + ret)
+                console.log(indent + "┕" + fn_name + ":", ret)
             } else {
                 console.log(indent + "┊" + fn_name)
             }
@@ -1655,11 +1766,27 @@ if (TRACE_EXECUTION) {
     }
 }
 
-let file = readFileSync("tests/micro/user.lua", "utf8");
-let parser = new Parser(file);
-let tokens = parser.parse();
+let error = null;
+let file, parser, tokens;
+try {
+    file = readFileSync("tests/micro/user.lua", "utf8");
+    parser = new Parser(file);
+    tokens = parser.statement_list();
+} catch (err) {
+    error = err;
+} finally {
+    flush();
+}
 
-for (let token of tokens) {
-    // if (token.type == TOKEN.VAR)
-    // console.log(token.toJSON());
+if (error) {
+    console.error(error);
+}
+
+if (tokens) {
+    console.log(JSON.stringify(tokens));
+    // console.log(JSON.stringify(tokens, null, "  "));
+    // for (let token of tokens) {
+        // if (token.type == TOKEN.VAR)
+        // console.log(token.toJSON());
+    // }
 }
